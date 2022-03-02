@@ -38,7 +38,9 @@ The purpose of each script is described below:
   
 5-Environmental_drivers:
   
-  -This script is for analysing plankton lifeform abundance data alongside processed nutrient and SST data.
+  -This script is for analysing plankton lifeform abundance data alongside processed nutrient, climate index and SST data.
+  
+  -Note: The environmental data has already been been extracted from the gridded NC files to save on total file size in the repository. Monthly mean values have been extracted as the mean of all cells within each polygon for each month. For station data this was calculated from a 5 nmi radius around each station. 
   
   -Boruta wrapper around random forest is used to determine the ability of environmental drivers to predict variation in lifeform abundance. 
   
