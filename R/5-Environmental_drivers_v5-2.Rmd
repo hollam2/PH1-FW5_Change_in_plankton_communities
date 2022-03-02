@@ -1,0 +1,411 @@
+---
+title: "Environmental drivers plankton abundance analysis"
+---
+
+This script is for analysing plankton lifeform abundance data alongside processed nutrient and SST data. 
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 1 March 2022
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+#enter a rough bounding box for visualisation only (in decimal degrees format)
+north <- 64
+west <- -16
+east <- 14
+south <- 34
+
+#enter the range of years covered by this analysis, the reference and comparison period will be calculated as the first n and the last n years of the dataset, with n determined by "ref_per" the variable
+start_query <- 1960
+end_query <- 2019
+
+#length of the reference period (controld the train-test split)
+ref_per <- 5
+
+#set the threshold for the proportion of years that must be represented in a dataset
+thr <- 0.5
+
+#enter the file directory path for the shapefile the data is partitioned with
+path_shp_part <- "../Data_raw/COMP4_assessment_areas_v7e/"
+
+#enter the filename of the shapefile the data is partitioned with
+file_shp_part <- "COMP4_assessment_areas_v7e.shp"
+
+#provide the name of the variable in the shapefile used for separating the assessment areas
+assess_des <- "LongName"
+
+#enter the main directory to use to access the processed data
+dir_main <- "../Data_processed/"
+
+#enter the directory where raw data is stored
+dir_raw <- "../Data_raw/"
+
+#enter the directory where the environmental data is stored
+dir_env <- paste0(dir_raw, "Environmental_data/")
+
+#enter the main directory to use to store image outputs
+dir_out <- "../Output/"
+
+#create plot output directory
+output_path <- paste(dir_out, gsub(".shp", "", file_shp_part), "/", sep="")
+dir.create(file.path(output_path), showWarnings = FALSE)
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+
+#install rnaturalearthhires for map data
+#devtools::install_github("ropensci/rnaturalearthhires")
+
+list.of.packages <- c("EnvStats", "dplyr", "ggplot2", "data.table", "tidyverse", "sf", "broom", "gridExtra", "pracma", "ggpattern", "fst", "ncdf4", "Matrix.utils", "exactextractr", "raster", "purrr", "broom", "Boruta", "caret", "ranger", "randomForest", "missForest", "zoo", "pdp", "ggpmisc")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages, new.packages)
+
+options(scipen=999)
+
+#switch off spherical geometry
+sf::sf_use_s2(FALSE)
+```
+Generate string for the relevant subdirectory 
+```{r}
+#save the data as fst
+dir_shp <- paste0(dir_main, gsub(".shp","",file_shp_part), "/")
+
+#generate a string for the directory of the relevant CSV file
+file_path <- paste0(dir_shp, gsub(".shp", "", file_shp_part), "_lifeforms_processed", ".fst")
+
+#read in the data
+df <- read_fst(file_path)
+
+#subset dataset to the year range of the analysis
+df <- subset(df, year >= start_query & year <= end_query)
+
+#convert months to character
+df$month <- ifelse(nchar(df$month)==1, paste0( 0,df$month),df$month)
+```
+Load the environmental data
+```{r}
+#reload the data
+df_all <- read_fst(path = paste0(dir_env, "df_all", ".fst"))
+```
+Load the relevant functions for diagnosing the models
+```{r, include=FALSE}
+# function for calculating adjusted r2
+adjr2 <- function(r2, n, k){
+  output <- 1 - (((1 - r2) * (n - 1)) / (n - k - 1))
+  return(output)
+}
+
+#function for determining the direction of partial effects
+rf_kendall <- function(mod, tr, vars){
+  kenlist <- list()
+  for(i in 1:length(vars)){
+  
+    rfdata <- partial(mod, train=tr, pred.var=vars[i])
+
+    x <- colnames(rfdata)[1]
+    y <- colnames(rfdata)[2]
+    
+    form1 <- as.formula(paste0(y, " ~ ", x))
+    
+    ken <- tidy(kendallTrendTest(y=form1, ci.slope = F, data=rfdata)) %>%
+      mutate(param = all_of(x))
+    
+    kenlist[[i]] <- ken
+  }
+  
+  kenlist <- do.call(rbind, kenlist)
+  return(kenlist)
+}
+
+remove_empty <- function(x){
+  if(is.list(x)) {
+    x %>%
+      purrr::discard(rlang::is_na) %>%
+      purrr::map(remove_empty)
+  } else {
+    x
+  }
+}
+```
+Generate RandomForest models to understand the importance of environmental variables to lifeform abundance
+```{r, include=FALSE}
+#read the list of variables to use for each lifeform
+df_lfvars <- fread(paste0(dir_env, "lifeform_driver_combos.csv")) %>%
+  pivot_longer(-lifeform,names_to="param", values_to="value") %>%
+  filter(value==1) %>%
+  dplyr::select(-value) %>%
+  group_by(lifeform) %>%
+  nest() %>%
+  mutate(vars = map(data, ~paste(sort(unique(.x$param))))) %>%
+  dplyr::select(-data) %>%
+  ungroup()
+
+#prepare the data for modelling
+by_data_id_lf_assess_id <- df %>%
+  left_join(df_all) %>%
+  dplyr::select(data_id, lifeform, assess_id, year, month, count_interp, param, value) %>%
+  filter(!is.na(count_interp)) %>%
+  #filter(data_id=="SE-SMHI-2") %>% # Specify filter by dataset
+  #filter(lifeform=="carniv") %>% # Specify filter by lifeform
+  #filter(assess_id=="Kattegat Coastal") %>% # Specify filter by assessment area
+  filter(year >= 1993) %>% # Specify filter by year cutoff
+  pivot_wider(names_from = param, values_from = value) %>% # transpose from long to wide format
+  type.convert(as.is=FALSE) %>% # convert everything to numeric
+  relocate(count_interp) %>% # move response variable to front of dataframe
+  group_by(data_id, assess_id, lifeform) %>%
+  filter(n() >= 60) %>% # dataset must include at least 60 months (5 years) to be assesses
+  filter(max(year) > (end_query - ref_per)) %>% # dataset must include the assessment period
+  filter(min(year) < (end_query - ref_per - 10)) %>% # datatset must include at least 10 years training data
+  nest() #%>% # create nested dataframe for modelling subsets 
+
+
+#prepare the variables for modelling
+model_data <- by_data_id_lf_assess_id %>%
+  left_join(df_lfvars, by="lifeform") %>%
+  mutate(
+    data = map(data, ~.x[,colSums(is.na(.x))<nrow(.x)]), # remove variables which are not represented in the data at all (all NA)
+    data = map(data,  ~.x %>% dplyr::select(which(colMeans(is.na(.)) < 0.5))), # remove variables which have more than x% NA
+    data = map(data, 
+        ~ pivot_longer(.x, -c(count_interp, year, month), names_to="param", values_to="value", values_drop_na = TRUE)), # pivot to long
+    data = map(data, ~mutate(.x, param2 = sub("\\_.*",'', .x$param))), # create second param variable with prefix for identifying duplicate vars
+    data = map(data, ~group_by(.x, param)),
+    data = map(data, ~mutate(.x, count = n())), # measure n-months in each duplicate variable to determine which to select
+    data = map(data, ~filter(.x, max(year) > (end_query - ref_per))),
+    data = map(data, ~ungroup(.x)),
+    data = map2(data, vars, ~filter(.x, param2 %in% .y)),
+    data = map(data, ~group_by(.x, param2)), # group by environmental variable and disregard source and units
+    data = map(data, ~mutate(.x, excl_dset = ifelse(grepl("ersem", param) & length(unique(param)) > 1, 1, 0))), # label modeled variables when there are better datasets available
+    data = map(data, ~filter(.x, excl_dset == 0)), # exclude ersem (modelled) data if better data available
+    data = map(data, ~filter(.x, count == max(count))), # second filter to select the most complete source of each variable (most months of data)
+    data = map(data, ~mutate(.x, var_sources = length(unique(param)))),
+    data = map(data, ~mutate(.x, param3 = ifelse(var_sources > 1, sort(param, decreasing = T)[1], param))), # if duplicates exist, choose one var source
+    data = map(data, ~ungroup(.x)),
+    data = map(data, ~filter(.x, param %in% unique(param3))),   
+    data = map(data, ~dplyr::select(.x, -c(param2, count, excl_dset, var_sources, param3))), # remove variables which are no longer needed
+    data = map(data, 
+        ~ pivot_wider(.x, names_from = param, values_from = value, values_fill = NA)), # pivot back to wide format
+    #ind = map(data, ~ifelse(.x$year <= min(.x$year)+(max(.x$year)-min(.x$year))*0.7, 1, 2)), # generate the 70:30 train-test partition
+    ind = map(data, ~ifelse(.x$year <= (end_query - ref_per), 1, 2)), # generate the train-test partition
+    trainO = map2(data, ind, ~as.data.frame(.x[.y==1,])), # generate the training data
+    testO = map2(data, ind, ~as.data.frame(.x[.y==2,])), # generate the testing data
+    train_imp = map(trainO, ~missRanger::missRanger(.x[,!names(.x) %in% c("count_interp")])), # impute NA values in predictors in each time series
+    train = map2(trainO, train_imp, ~cbind(count_interp=.x[,"count_interp"], .y)), # combine imputed data with the response
+    train = map(train, ~mutate_at(.x, vars(c(-year,-month,-amo_noaa)), ~rollapply(.x, 12, mean, fill=NA))), # calculate 12-month rolling mean of each variable
+    #train = map2(train, trainO, ~mutate(.x, amo_noaa = .y$amo_noaa)), # add AMO variable (original data product already detrended)
+    train = map(train, ~.x[min(which(!is.na(.x))):(nrow(.x)-(min(which(!is.na(.x))))),]), # remove first and last six months (all NA due to moving window) from de-seasonalised series
+    train = map(train, ~dplyr::select(.x, -c(month))), # exclude month variables from modelling
+    test_imp = map(testO, ~missRanger::missRanger(.x[,!names(.x) %in% c("count_interp")])), # impute NA values in predictors in each time series
+    test = map2(testO, test_imp, ~cbind(count_interp=.x[,"count_interp"], .y)), # combine imputed data with the response
+    test = map(test, ~mutate_at(.x, vars(c(-year,-month,-amo_noaa)), ~rollapply(.x, 12, mean, fill=NA))), # calculate 12-month rolling mean of each variable
+    #test = map2(test, testO, ~mutate(.x, amo_noaa = .y$amo_noaa)), # add AMO variable (original data product already detrended)
+    test = map(test, ~.x[min(which(!is.na(.x))):(nrow(.x)-(min(which(!is.na(.x))))),]), # remove first and last six months (all NA due to moving window) from de-seasonalised series
+    test = map(test, ~dplyr::select(.x, -c(month))), # exclude month variables from modelling
+    # ensure same variables in train and test sets
+    n_train = map_dbl(train, ~nrow(.x)),
+    n_test = map_dbl(test, ~nrow(.x))
+    )
+
+#generate the models
+models_ini <- model_data %>%
+  mutate(
+    rf = map(train, ~ranger::ranger(count_interp~., data=.x)), # use the training data to create the first model
+    rf_nvar = map_dbl(train, ~ncol(.x)-1),
+    rf_oob = map_dbl(rf, ~.x$prediction.error), # get the out of bag error
+    rf_pred = map2(rf, test, ~predict(.x, .y)), # run a prediction on the first model
+    rf_pred = map2(rf_pred, test, ~caret::postResample(.x$predictions, .y$count_interp)), # determine RMSE and rsquared of the model
+    rf_rmse = map_dbl(rf_pred, "RMSE"), # extract RMSE
+    rf_rsquared = map_dbl(rf_pred, "Rsquared"), # extract rsquared
+    rf_rsquared_adj = pmap_dbl(list(rf_rsquared, n_train, rf_nvar), ~adjr2(..1,..2,..3)),
+    boruta = map(train, ~Boruta::Boruta(count_interp~.,data=.x, doTrace = 2)), # feature selection on the full dataset with Boruta algorithm
+    boruta = map(boruta, ~if(any(as.vector(.x$finalDecision)=="Tentative")){TentativeRoughFix(.x)}else{.x}), # rough fix for tentative variables
+    boruta_stats = map(boruta, Boruta::attStats), # generate a table of importance values from the Boruta output
+    boruta_stats = map(boruta_stats, ~dplyr::arrange(.x, -meanImp)), # arrange the table in descending order of importance
+    rfboruta_vars = map(boruta_stats, ~rownames(.x)[.x[,"decision"]=="Confirmed"]), # generate a vector of variable names
+    train = map2(train, rfboruta_vars, ~.x[,c("count_interp", .y)]), # select only the confirmed variables from the training data
+    test = map2(test, rfboruta_vars, ~.x[,c("count_interp", .y)]) # select only the confirmed variables from the testing data
+  )
+
+models_reject <- models_ini %>%
+  mutate(valid_model = map_chr(boruta_stats, ~!all(.x[,"decision"]=="Rejected"))) %>%
+  filter(valid_model==FALSE) %>%
+  dplyr::select(-valid_model)
+
+models_keep <- models_ini %>%
+  mutate(valid_model = map_chr(boruta_stats, ~!all(.x[,"decision"]=="Rejected"))) %>%
+  filter(valid_model==TRUE) %>%
+  dplyr::select(-valid_model)
+
+models_fin <- models_keep %>%
+  mutate(
+    rfboruta = map(train, ~ranger::ranger(count_interp~.,data=.x)), # generate the new model improved by Boruta feature selection
+    rfboruta_nvar = map_dbl(boruta_stats, ~nrow(subset(.x, decision=="Confirmed"))),
+    rfboruta_oob =  map(rfboruta, ~.x$prediction.error), # get the out of bag error of the improved model
+    rfboruta_pred = map2(rfboruta, test, ~predict(.x, .y)), # run a prediction on the improved model
+    rfboruta_stats = map2(rfboruta_pred, test, ~caret::postResample(.x$predictions, .y$count_interp)), # determine RMSE and rsquared of the improved model
+    #rfboruta_kendall = pmap(list(rfboruta, train, rfboruta_vars), ~rf_kendall(mod=..1, tr=..2, vars=..3)),
+    rfboruta_rmse = map_dbl(rfboruta_stats, "RMSE"), # extract RMSE
+    rfboruta_rsquared = map_dbl(rfboruta_stats, "Rsquared"), # extract rsquared
+    rfboruta_rsquared_adj = pmap_dbl(list(rfboruta_rsquared, n_train, rfboruta_nvar), ~adjr2(..1,..2,..3))
+    )
+
+#add the rejected models to the dataframe
+models_reject[colnames(models_fin)[!colnames(models_fin) %in% colnames(models_reject)]] <- NA
+```
+Save the model outputs into a directory
+```{r}
+#function for saving all models by dataset
+save_rf_models <- function(x, y, dir){
+
+  if(nrow(y)>0){
+  temp <- x %>%
+    bind_rows(y)
+  }else{
+    temp <- x
+  }
+  
+  data_ids <- sort(unique(temp$data_id))
+  
+  for(i in 1:length(data_ids)){
+    
+    out <- temp %>%
+      filter(data_id == data_ids[i]) %>%
+      dplyr::select(-c(data, ind, trainO, train, train_imp, testO, test, test_imp, rf, boruta, rfboruta, rfboruta_stats))
+    
+    saveRDS(out, paste0(dir, data_ids[i], ".RDS"))
+  }
+
+}
+
+#generate directory for the plots
+output_path_traj <- paste(dir_main, "RF_models", "/", sep="")
+dir.create(file.path(output_path_traj), showWarnings = FALSE)
+
+save_rf_models(x=models_fin, y=models_reject, dir=output_path_traj)
+```
+Plot the partial effects
+```{r, eval=FALSE}
+#function for determining the direction of partial effects
+rf_plot <- function(x, d_id, lf_id, a_id){
+
+  dat <- x %>%
+    filter(data_id==all_of(d_id) &
+           assess_id==all_of(a_id) &
+             lifeform==all_of(lf_id))
+  
+  vars = dat$rfboruta_vars[[1]]
+  
+  lims <- range(partial(dat$rfboruta[[1]], train=dat$train[[1]], pred.var=vars[1])[,2])
+  
+  plotlist <- list()
+  for(i in 1:length(vars)){
+  
+    rfdata <- partial(dat$rfboruta[[1]], train=dat$train[[1]], pred.var=vars[i])
+    plot_temp <- plotPartial(rfdata, ylim=lims)
+
+    plotlist[[i]] <- plot_temp
+  }
+  
+  return(plotlist)
+}
+
+rf_plot(x=models_fin, d_id="UK-MBA-1", lf_id="diatom", a_id="Coastal NOR 1")
+```
+Examine plots of prediction versus the test data
+```{r, eval=FALSE}
+plot_vars_top <- function(x, d_id, lf_id, a_id){
+  
+  temp <- x %>%
+    filter(data_id==all_of(d_id)) %>%
+    filter(lifeform==all_of(lf_id)) %>%
+    filter(assess_id==all_of(a_id)) 
+  
+  boruta_stats <- temp$boruta_stats[[1]] %>%
+    filter(decision=="Confirmed")
+  
+  vars <- rownames(boruta_stats)
+  
+  title <- paste0(d_id, ", ", lf_id, ", ", a_id, "\n",
+                  "r2: ", 
+                  round(temp$rfboruta_rsquared[1],3), ", ",
+                  "adj_r2: ", 
+                  round(temp$rfboruta_rsquared_adj[1],3), ", ",
+                  "RMSE: ",
+                  round(temp$rfboruta_stats[[1]][names(temp$rfboruta_stats[[1]])=="RMSE"],3))
+  
+  #create labeller lookup table
+  df_lookup_main <- data.frame(param=all_of(vars), meanImp=boruta_stats$meanImp) %>%
+    mutate(meanImp = round(meanImp, 2)) %>%
+    mutate(string = paste0(param, " imp: ", meanImp)) %>%
+    distinct()
+  
+  df_lookup_main <- setNames(df_lookup_main$string, df_lookup_main$param)
+  
+  formula1 = y ~ x
+  
+  gg1 <- as.data.frame(temp[,"train"][[1]]) %>%
+    dplyr::select("count_interp", all_of(vars)) %>%
+    pivot_longer(-count_interp, names_to = "param", values_to = "value") %>%
+    left_join(data.frame(param=rownames(boruta_stats),
+      meanImp=boruta_stats$meanImp), by="param") %>%
+    mutate(param = as.factor(param)) %>%
+    mutate(param = fct_reorder(param, meanImp, .desc=TRUE)) %>%
+    arrange(param) %>%
+    filter(!is.na(value)) %>%
+    ggplot(., aes(value, count_interp)) +
+    geom_point(aes(value, count_interp), alpha=0.1)+
+    geom_smooth(aes(value, count_interp), method="lm", formula = formula1)+
+    facet_wrap(~param, scales="free_x", labeller = labeller(param=df_lookup_main))+
+    ggtitle(title)+
+    theme(plot.title = element_text(hjust = 0.5))+
+    stat_poly_eq(aes(label = paste(..eq.label.., sep = "~~~")), 
+               label.x.npc = "right", label.y.npc = 0.15,
+               eq.with.lhs = "italic(hat(y))~`=`~",
+               eq.x.rhs = "~italic(x)",
+               formula = formula1, parse = TRUE, size = 5) +
+  stat_poly_eq(aes(label = paste(..rr.label.., sep = "~~~")), 
+               label.x.npc = "right", label.y.npc = "bottom",
+               formula = formula1, parse = TRUE, size = 5) 
+  
+  dates <- temp$testO[[1]] %>%
+    filter(rownames(.) %in% rownames(temp$test[[1]])) %>%
+    mutate(date = as.Date(paste(year, month, "16", sep="-"))) %>%
+    dplyr::select(date)
+  
+  test_pred <- rbind(
+  data.frame(count = temp$test[[1]]$count_interp, type=as.factor("Observed"), date=dates),
+  data.frame(count = temp$rfboruta_pred[[1]]$predictions, type=as.factor("Full model"), date=dates)
+  )
+  
+  cols <- c("Observed" = "grey60", "Full model" = "red")
+  
+  lims <- range(c(temp$train[[1]]$count_interp, temp$test[[1]]$count_interp))
+  
+  gg2 <- ggplot()+
+    ggtitle(title)+
+    #geom_point(data=test_pred, aes(date, count, colour=type))+
+    geom_line(data=test_pred, aes(date, count, colour=type))+
+    scale_colour_manual(values = cols, name="Data")+
+    scale_y_continuous(limits = lims, name=bquote(log[10]* "(" * .(lf_id) * ")"))+
+    scale_x_date(breaks="1 year", labels=scales::date_format("%Y"))+
+    theme_bw()+
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.title.x = element_blank())
+
+
+  
+  gglist <- list()
+  gglist[[1]] <- gg2
+  gglist[[2]] <- gg1
+  
+  return(gglist)
+  
+  }
+
+plot_vars_top(x=models_fin, d_id="UK-EA-1", lf_id="diatom", a_id="Liverpool Bay plume")
+```

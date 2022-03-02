@@ -1,0 +1,169 @@
+---
+title: "RAW CPR loader tool"
+---
+
+This tool reads raw CPR data and prepares it to be in the same format as the other plankton datasets.
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 1 March 2022
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+#enter the directory for where the processed CPR data is to be stored
+dir_main <- "../Data_processed/"
+
+#enter the directory for where the raw CPR data is stored
+dir_cpr <- "../Data_raw/CPR_data/"
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+list.of.packages <- c("tidyverse", "data.table", "readxl", "janitor", "fst", "worms")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages)
+```
+Create subdirectories for processed data if not already done
+```{r}
+#generate directory for processed data
+dir.create(file.path(dir_main), showWarnings = FALSE)
+```
+Read in and process the RAW CPR data
+```{r, warning=FALSE}
+#load CPR headers
+df_cpr_headers <- as.data.frame(fread(paste0(dir_cpr, "CPR_OSPAR_1960_2019_data.csv"), nrow=2, header=FALSE))
+headers_names <- sapply(df_cpr_headers, paste, collapse="_")
+headers_names <- gsub("'", "", headers_names)
+rm(df_cpr_headers)
+
+#load CPR data and apply headers to data
+df_cpr <- fread(paste0(dir_cpr, "CPR_OSPAR_1960_2019_data.csv"), skip = 2, header=FALSE)
+names(df_cpr) <- headers_names
+rm(headers_names)
+
+#melting the data in records
+id_vars <- c("_Lat","_Lon","_Year","_Month", "_Day","_Hour", "_Minute")
+measure_vars <- colnames(df_cpr)[!(colnames(df_cpr) %in% id_vars)]
+df_cpr <- data.table::melt(df_cpr, id.vars = id_vars,
+                           measure.vars = measure_vars,
+                           value.name = "count")
+rm(id_vars, measure_vars)
+
+df_cpr$variable <- as.character(df_cpr$variable)
+
+df_cpr <- df_cpr[, c("taxon", "cpr_id") 
+      := as.list(strsplit(variable, "_")[[1]]), by=variable ]
+
+#remove column that has now been separated
+df_cpr <- df_cpr[,variable:=NULL]
+
+#fix column names
+cols <- names(df_cpr)[1:7]
+cols <- tolower(gsub("_", "", cols))
+df_cpr <- setnames(df_cpr, 1:7, cols)
+
+#remove taxa that were not looked for before a certain date
+df_nan <- df_cpr %>%
+  dplyr::select(taxon, count) %>%
+  filter(is.nan(count)) %>%
+  distinct(.keep_all = TRUE) %>%
+  dplyr::select(taxon)
+
+df_cpr <- df_cpr %>%
+  filter(!(taxon %in% all_of(df_nan$taxon)))
+
+rm(df_nan)
+```
+Match the AphiaIDs with the CPR IDs since the CPR uses a different indexing system.
+```{r}
+df_index <- read_excel(paste0(dir_cpr, "aphia_CPR_ID_included.xlsx"), sheet = "Sheet1")
+df_index <- janitor::clean_names(df_index)
+df_index <- data.frame(lapply(df_index[,1:2], as.character), stringsAsFactors=FALSE)
+
+df_cpr <- merge(df_cpr, df_index, by="cpr_id")
+rm(df_index)
+```
+Prepare data to be in same format as df_abund so that it can be processed with the rest of the datasets in the same dataflow
+```{r}
+df_cpr <- data.table(data_id = "UK-MBA-1", 
+                     year = df_cpr$year, 
+                     month=df_cpr$month, 
+                     day=df_cpr$day,
+                     hour=df_cpr$hour, 
+                     minute=df_cpr$minute,
+                     lat = df_cpr$lat,
+                     lon=df_cpr$lon,
+                     taxon=df_cpr$taxon,
+                     aphia_id=df_cpr$aphia_id,
+                     count=df_cpr$count) %>%
+          filter(count > 0)
+```
+Aggregate by Aphia ID using WoRMS. This step ensures that all taxa are labelled according to their latin name on WoRMS
+```{r}
+#function to match data from WoRMS to the abundance datasets
+load_worms <- function(x) {
+  unique_aphias <- x %>%
+    dplyr::select(aphia_id) %>%
+    unique() %>%
+    dplyr::mutate(aphia_id = as.integer(aphia_id))
+
+  
+  if(file.exists(paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))){
+    #load the file if it exists
+    df_wms <- fread(paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))
+    df_wms <- data.frame(lapply(df_wms, as.character), stringsAsFactors=FALSE)
+  } else {
+    #otherwise request data from WoRMS
+    df_wms <- worms::wormsbyid(unique_aphias$aphia_id)
+    df_wms <- data.frame(lapply(df_wms, as.character), stringsAsFactors=FALSE)
+  }
+  
+  #check if all Aphia IDs in the dataset are present. If not, download the data again to update it.
+  if(!all(unique(x$aphia_id) %in% df_wms$AphiaID)){
+      
+      #find the additional missing IDs
+      missing_ids <- sort(unique(x$aphia_id))[!sort(unique(x$aphia_id)) %in% df_wms$AphiaID]
+      
+      unique_aphias <- unique_aphias %>%
+      filter(aphia_id == missing_ids)
+     
+      df_wms2 <- worms::wormsbyid(unique_aphias$aphia_id)
+      df_wms2 <- data.frame(lapply(df_wms2, as.character), stringsAsFactors=FALSE)
+  
+      df_wms <- rbind(df_wms, df_wms2)
+}
+
+  return(df_wms)
+
+}
+
+df_wms <- load_worms(x=df_cpr)
+
+#save the updated Aphia ID and taxon list
+fwrite(df_wms, paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))
+
+#replace taxon scientific names from WoRMS for relevant Aphia IDs in abundance data and sum per sample
+df_cpr$taxon2 <- df_wms$scientificname[match(df_cpr$aphia_id, df_wms$AphiaID)]
+df_cpr$taxon2[is.na(df_cpr$taxon2)] <- df_cpr$taxon[is.na(df_cpr$taxon2)]
+df_cpr$taxon <- df_cpr$taxon2
+df_cpr$taxon2 <- NULL
+
+df_output <- df_cpr %>%
+    group_by(across(c(-count))) %>%
+    dplyr::summarise(count = sum(count),
+              .groups = "drop")
+```
+Save the formatted data for ease of use rather than preparing the CPR data each time it is needed
+```{r}
+#create output
+write_fst(df_output, path=paste0(dir_main, "df_cpr.fst"))
+```
+
+
+
+
+

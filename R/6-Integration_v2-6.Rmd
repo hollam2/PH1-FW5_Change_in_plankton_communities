@@ -1,0 +1,332 @@
+---
+title: "Integration of environmental drivers with plankton abundance time-series analysis"
+---
+
+This script is for loading the results of the modelling environmental drivers and integrating with Mann-Kendall statistic for the plankton lifeform abundance time-series. 
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 17 December 2021
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+#enter a rough bounding box for visualisation only (in decimal degrees format)
+north <- 64
+west <- -16
+east <- 14
+south <- 34
+
+#reference period duration (in years)
+ref_per <- 5
+
+#enter the range of years covered by this analysis, the reference and comparison period will be calculated as the first n and the last n years of the dataset, with n determined by "ref_per" the variable
+start_query <- 1960
+end_query <- 2019
+
+#enter the file directory path for the shapefile the data is partitioned with
+path_shp_part <- "../Data_raw/COMP4_assessment_areas_v7e/"
+
+#enter the filename of the shapefile the data is partitioned with
+file_shp_part <- "COMP4_assessment_areas_v7e.shp"
+
+#provide the name of the variable in the shapefile used for separating the assessment areas
+assess_des <- "LongName"
+
+#enter the main directory to use to access the processed data
+dir_main <- "../Data_processed/"
+
+#enter the directory where raw data is stored
+dir_raw <- "../Data_raw/"
+
+#enter the main directory to use to store image outputs
+dir_out <- "../Output/"
+
+#create plot output directory
+output_path <- paste(dir_out, gsub(".shp", "", file_shp_part), "/", sep="")
+dir.create(file.path(output_path), showWarnings = FALSE)
+
+#generate directory for the plots
+output_path_drivers <- paste(output_path, "drivers_", start_query, "_to_", end_query, "/", sep="")
+dir.create(file.path(output_path_drivers), showWarnings = FALSE)
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+
+#install rnaturalearthhires for map data
+devtools::install_github("ropensci/rnaturalearthhires")
+
+list.of.packages <- c("EnvStats", "dplyr", "ggplot2", "data.table", "tidyverse", "broom", "gridExtra", "pracma", "ggpattern", "fst", "sf", "lemon", "viridis", "RColorBrewer")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages, new.packages)
+
+options(scipen=999)
+
+#switch off spherical geometry
+sf::sf_use_s2(FALSE)
+```
+Generate string for the relevant subdirectory 
+```{r}
+#save the data as fst
+dir_shp <- paste0(dir_main, gsub(".shp","",file_shp_part), "/")
+
+#generate a string for the directory of the relevant CSV file
+file_path <- paste0(dir_shp, gsub(".shp", "", file_shp_part), "_lifeforms", ".fst")
+
+#load the Kendall results
+df_fits_tot <- read_fst(path=paste0(gsub(".fst", "", file_path), "_kendall", ".fst"))
+```
+Import the results of the model fitting process from Step5 script
+```{r}
+#function for saving all models by dataset
+load_rf_models <- function(dir){
+
+  files <- sort(list.files(dir, full.names = T))
+  
+  df_list <- list()
+  for(i in 1:length(files)){
+    
+    temp <- readRDS(files[i])
+    
+    df_list[[i]] <- temp
+  }
+  
+  out <- do.call(rbind, df_list)
+  return(out)
+}
+```
+Integrate the model variable selections and the time-series analyses
+```{r}
+#generate directory for the plots
+input_path_rf <- paste(dir_main, "RF_models", "/", sep="")
+
+df_rf_orig <- load_rf_models(dir=input_path_rf)
+
+df_rf <- df_rf_orig %>%
+  dplyr::select(data_id, lifeform, assess_id, n_train, n_test, boruta_stats, rfboruta_rsquared) %>%
+  relocate(boruta_stats, .after = last_col()) %>%
+  dplyr::mutate(boruta_stats = map(boruta_stats, 
+        ~ dplyr::mutate(.x, vars = rownames(.x)))
+        ) %>%
+  dplyr::mutate(boruta_stats = map(boruta_stats, ~ dplyr::select(.x, vars, meanImp, decision)))
+
+boruta_stats <- df_rf %>%
+  unnest_wider(boruta_stats) %>%
+  group_by(data_id, lifeform, assess_id) %>%
+  dplyr::summarise(across(c(vars, meanImp, decision), unlist), .groups = "drop") %>%
+  dplyr::mutate(meanImp = round(meanImp, 4),
+    meanImp = ifelse(decision=="Rejected",0,meanImp)) %>%
+  dplyr::select(-decision) %>%
+  pivot_wider(names_from=vars, values_from=meanImp, values_fill = NA) %>%
+  dplyr::select(sort(tidyselect::peek_vars())) %>%
+  relocate(data_id, lifeform, assess_id) %>%
+  pivot_longer(-c(data_id, lifeform, assess_id), names_to = "param", values_to = "value", values_drop_na = TRUE) %>%
+  dplyr::mutate(param = sub("\\_.*",'', param)) %>%
+  pivot_wider(names_from = param, values_from = value, values_fill = NA)
+```
+Join all data into a combined dataframe
+```{r}
+df_comb <- df_rf %>%
+  full_join(df_fits_tot) %>%
+  dplyr::select(-c(n_test, boruta_stats)) %>%
+  full_join(boruta_stats)
+```
+Select the dataset to display visually when there are multiple from different datasets and combine with the Kendall results
+```{r, include=FALSE}
+lifeforms <- c("diatom", "dinoflagellate", "holoplankton", "meroplankton", "gelatinous", "fishlarvae", "lg_copepods", "sm_copepods")
+lifeforms_rep <- c("Diatoms", "Dinoflagellates", "Holoplankton", "Meroplankton", "Gelatinous", "Fish larvae/eggs", "Large copepods", "Small copepods")
+
+#subset to lifeforms of interest for the final assessment
+df_summary <- df_comb %>%
+  group_by(assess_id, lifeform) %>% #determine the datasets with the most months of real samples in an assessment unit
+  filter(unique_months == max(unique_months, na.rm=T)) %>%
+  ungroup() %>%
+  dplyr::select(-unique_months, -prop_years)
+
+df_unique_months <- df_summary %>%
+  pivot_longer(cols = -c(1:8), names_to = "param", values_to = "imp") %>%
+  filter(!is.na(imp)) %>%
+  arrange(assess_id, lifeform, -imp) %>%
+  filter(param!="year") %>%
+  dplyr::mutate(param = factor(param, levels=sort(unique(param)))) %>%
+  dplyr::mutate(param_type = recode(param,
+                        sst="Temp",
+                        wspd="Wind",
+                        precip="Precip",
+                        mld="MLD",
+                        cvel="Current",
+                        nppv="Productivity",
+                        attn="Attenuation",
+                        psal="Salinity",
+                        amo="Climate_index",
+                        nao="Climate_index",
+                        phos="Nutrients",
+                        ptot="Nutrients",
+                        slca="Nutrients",
+                        ntot="Nutrients",
+                        ntra="Nutrients",
+                        amon="Nutrients",
+                        year="Year",
+                        spco2="Carbonate")) %>%
+  group_by(assess_id, lifeform) %>%
+  filter(imp==max(imp, na.rm=T)) %>%
+  ungroup() %>%
+  dplyr::mutate(param_type = factor(param_type, levels=sort(as.character(unique(param_type)))))
+
+```
+Load map data
+```{r}
+#load shapefile of European landmass for display
+coast <- rnaturalearth::ne_countries(returnclass = "sf", scale = "large")
+
+#load the shapefile associated with the data
+shp_part <- st_read(paste(path_shp_part, file_shp_part, sep=""))
+
+#choose the variable to use as the primary separator of assessment areas
+shp_part$assess_id <- shp_part[[assess_des]]
+```
+Create sf with multi-geometry (polygon and point)
+```{r}
+#import point coordinates of datasets
+df_datasets <- fread(file=paste0(dir_main, "dataset_ids_and_point_id.csv"))
+
+assess_id_list <- df_datasets %>%
+    filter(is_point) %>%
+    dplyr::select(assess_id, mean_lon, mean_lat) %>%
+    distinct() %>%
+    filter(unique(assess_id) %in% all_of(unique(df_unique_months$assess_id))) %>%
+    dplyr::rename("x"="mean_lon",
+           "y"="mean_lat")
+
+pts <- st_as_sf(assess_id_list, coords = c("x","y"), remove = FALSE)
+st_crs(pts) <- 4326
+pts <- st_transform(pts, crs=st_crs(shp_part))
+pts <- pts %>% dplyr::select(assess_id, geometry) %>% dplyr::mutate(is_point=TRUE, is_plume=FALSE)
+```
+Create separate designation for river plumes
+```{r, include=FALSE}
+#create sf object for points
+plume_list <- shp_part %>%
+    dplyr::select(assess_id, geometry) %>%
+    distinct() %>%
+    filter(grepl("plume",tolower(assess_id))) %>%
+    dplyr::mutate(geometry = st_transform(geometry, 2163)) %>%
+    dplyr::mutate(coords = st_centroid(geometry)) %>%
+    dplyr::mutate(geometry = NULL) %>%
+    dplyr::mutate(coords = st_transform(coords, 4326)) %>%
+    unnest_wider(coords) %>%
+    dplyr::rename("x"="...1",
+         "y"="...2")
+
+plumes <- st_as_sf(plume_list, coords = c("x","y"), remove = FALSE)
+st_crs(plumes) <- 4326
+plumes <- st_transform(plumes, crs=st_crs(shp_part))
+plumes <- plumes %>% dplyr::select(assess_id, geometry) %>% dplyr::mutate(is_point=FALSE, is_plume=TRUE) %>% dplyr::select(names(pts))
+
+```
+Merge the points and plumes coordinates with the shapefile
+```{r}
+#merge geometry of points and polygons
+shp_comb <- shp_part %>%
+  dplyr::mutate(is_point=FALSE, is_plume=FALSE) %>%
+  dplyr::select(names(pts)) %>%
+  bind_rows(pts) %>%
+  bind_rows(plumes)
+```
+Combine the variable importance data with the map data
+```{r}
+lf_shp <- expand.grid(lifeform = unique(df_unique_months$lifeform), assess_id = unique(shp_comb$assess_id)) %>%
+  arrange(lifeform, assess_id)
+
+shp_merged <- merge(shp_comb, lf_shp, by="assess_id", all=T)
+shp_merged <- merge(shp_merged, df_unique_months, by=c("assess_id", "lifeform"), all.x=TRUE)
+
+st_crs(shp_merged) <- 4326
+
+#arrange factor levels 
+shp_merged$param_type <- factor(shp_merged$param_type, levels=sort(unique(shp_merged$param_type)))
+shp_merged$assess_id <- factor(shp_merged$assess_id, levels=sort(unique(shp_merged$assess_id)))
+```
+Summarise in map form
+```{r}
+#rsquared threshold
+rsq_thr <- 0.2
+
+#importance threshold
+imp_thr <- 0
+
+#generate colour palette
+my.cols <- brewer.pal(length(levels(shp_merged$param_type)), "Set3")
+my.cols[my.cols=="#D9D9D9"] <- "#FFED6F" #replace grey in palette
+
+my.cols[6] <- "#B3DE69"
+my.cols[7] <- "#80B1D3"
+my.cols[5] <- "#FDB462"
+
+#generate the plot output
+  ggplot()+
+  geom_sf(data=coast, inherit.aes=F, fill="grey80", colour="grey40", lwd = 0.2)+
+  geom_sf(data=subset(shp_merged, 
+                      is_point == F & 
+                        is_plume==F), 
+          fill="white", colour="black", lwd = 0.2)+
+    geom_sf(data=subset(shp_merged, 
+                      is_point == F & 
+                        is_plume==F &
+                        is.na(statistic)), 
+          fill="white", colour="black", lwd = 0.2)+
+  geom_sf(data=subset(shp_merged, 
+                      (is_point == F & 
+                        is_plume == F &
+                        sig == T) &
+                        (rfboruta_rsquared < rsq_thr |
+                        imp < imp_thr)), 
+          fill="grey60", colour="black", lwd = 0.2)+
+  geom_sf(data=subset(shp_merged, 
+                      is_point == F &
+                        is_plume == F &
+                         sig == T &
+                        !is.na(imp) &
+                        rfboruta_rsquared >= rsq_thr &
+                        imp >= imp_thr), 
+          aes(fill=param_type), colour="black", lwd = 0.1, alpha=0.9)+
+  geom_sf(data=subset(shp_merged, 
+                        is_plume == T &
+                        sig == T &
+                        !is.na(imp) & 
+                        rfboruta_rsquared >= rsq_thr &
+                        imp >= imp_thr), 
+          aes(fill=param_type), colour="black", alpha=0.9, shape=24, size=3)+
+  geom_sf(data=subset(shp_merged, 
+                        is_point == T &
+                        sig == T &
+                        !is.na(imp) & 
+                        rfboruta_rsquared >= rsq_thr &
+                        imp >= imp_thr), 
+          aes(fill=param_type), colour="black", alpha=0.9, shape=21, size=3)+
+  facet_rep_wrap(~lifeform, repeat.tick.labels = TRUE, ncol=4)+
+  coord_sf(xlim=c(west, east), ylim=c(south, north), expand=FALSE)+
+  scale_fill_manual("Most\nimportant\npressure", values=my.cols)+
+  theme_bw()+
+  theme(plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+      strip.text.x = element_text(size = 9))+
+  guides(fill=guide_legend(override.aes=list(shape=NA)))
+  
+  ggsave(file=paste(output_path_drivers, "lifeforms", ".png", sep=""), 
+         height=40, width=30, units="cm", bg="white", dpi=500)
+
+
+```
+
+
+
+
+
+

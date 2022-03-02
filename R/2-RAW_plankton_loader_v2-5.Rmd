@@ -1,0 +1,410 @@
+---
+title: "RAW plankton loader tool"
+---
+
+This tool reads raw plankton data from national datasets which has already been aggregated into a single dataframe. This data is combined with the CPR data from the previous step and lifeforms are identified from a Master List before saving the output.
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 1 March 2022
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+#turn off scientific notation
+options(scipen=999)
+
+#enter the directory for where the processed data is to be stored
+dir_main <- "../Data_processed/"
+
+#enter the directory for where the raw data is stored
+dir_raw <- "../Data_raw/"
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+list.of.packages <- c("tidyverse", "data.table", "readxl", "janitor", "fst")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages)
+```
+Create subdirectories for processed data if not already done
+```{r}
+#generate directory for processed data
+dir.create(file.path(dir_main), showWarnings = FALSE)
+```
+Read in the DASSH Master List for matching to the raw data
+```{r}
+df_master <- read_excel(paste0(dir_raw, "Masterlist-V5_working.xlsx"), sheet = "SpeciesInfo")
+df_master <- janitor::clean_names(df_master) #make the column names more R friendly
+```
+Read in the RAW data
+```{r}
+#load the plankton abundance data
+df_abund <- read_fst(paste0(dir_raw, "df_abund.fst")) %>%
+  filter(abundance > 0 & !is.na(aphia_id))
+```
+Process the RAW data to have clean scientific names and Aphia IDs 
+```{r}
+#subset to remove samples deeper than a user-specified cut-off depth
+cutoff <- 60
+df_abund <- subset(df_abund, is.na(depth_max) | depth_max <= cutoff)
+
+#function to match data from WoRMS to the abundance datasets
+load_worms <- function(x) {
+  unique_aphias <- x %>%
+    dplyr::select(aphia_id) %>%
+    unique() %>%
+    dplyr::mutate(aphia_id = as.integer(aphia_id))
+
+  
+  if(file.exists(paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))){
+    #load the file if it exists
+    df_wms <- fread(paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))
+    df_wms <- data.frame(lapply(df_wms, as.character), stringsAsFactors=FALSE)
+  } else {
+    #otherwise request data from WoRMS
+    df_wms <- worms::wormsbyid(unique_aphias$aphia_id)
+    df_wms <- data.frame(lapply(df_wms, as.character), stringsAsFactors=FALSE)
+  }
+  
+  #check if all Aphia IDs in the dataset are present. If not, download the data again to update it.
+  if(!all(unique(x$aphia_id) %in% df_wms$AphiaID)){
+      
+      #find the additional missing IDs
+      missing_ids <- sort(unique(x$aphia_id))[!sort(unique(x$aphia_id)) %in% df_wms$AphiaID]
+      
+      unique_aphias <- unique_aphias %>%
+      filter(aphia_id %in% all_of(missing_ids))
+     
+      df_wms2 <- worms::wormsbyid(unique_aphias$aphia_id)
+      df_wms2 <- data.frame(lapply(df_wms2, as.character), stringsAsFactors=FALSE)
+  
+      df_wms <- rbind(df_wms, df_wms2)
+      fwrite(df_wms, paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))
+}
+
+  return(df_wms)
+
+}
+
+df_wms <- load_worms(x=df_abund)
+
+#save the updated Aphia ID and taxon list
+fwrite(df_wms, paste0(dir_main, "aphia_ids_and_names_from_worms.csv"))
+
+#replace taxon scientific names from WoRMS for relevant Aphia IDs in abundance data and sum per sample
+df_abund$taxon2 <- df_wms$scientificname[match(df_abund$aphia_id, df_wms$AphiaID)]
+df_abund$taxon2[is.na(df_abund$taxon2)] <- df_abund$taxon[is.na(df_abund$taxon2)]
+df_abund$taxon <- df_abund$taxon2
+df_abund$taxon2 <- NULL
+rm(df_wms)
+
+df_abund <- df_abund %>%
+  dplyr::select(-comment) %>%
+  group_by(across(c(-abundance))) %>%
+  dplyr::summarise(abundance = sum(abundance),
+            .groups = "drop")
+```
+Convert units to be consistent across datasets
+```{r, warning=FALSE}
+#recode the abundance units to be consistent across datasets
+df_abund$abundance_type_units <- tolower(df_abund$abundance_type_units)
+
+df_abund$abundance_type_units <- recode_factor(df_abund$abundance_type_units, 
+                                               "cell numbers per litre of water" = "cells/l",
+                                               "cells/litre" = "cells/l",
+                                               "hose sample cells/l" = "cells/l",
+                                               "cells / l" = "cells/l",
+                                               "numbers of individuals per cubic metre" = "cells/m3",
+                                               "individuals/m3" = "cells/m3",
+                                               "number/m3 (number individuos per cubic meter)" = "cells/m3",
+                                               "numbers / m3" = "cells/m3",
+                                               "abundance m-3" = "cells/m3",
+                                               "no of individuals per m3" = "cells/m3",
+                                               "count m-3" = "cells/m3",
+                                               "indiv. / m3" = "cells/m3",
+                                               "net sample (wp2) ind/m3" = "cells/m3",
+                                               "nr/m3" = "cells/m3",
+                                               "cells per ml" = "cells/ml",
+                                               "count" = "cells/m3")
+unique(df_abund$abundance_type_units)
+
+#convert abundance units to a consistent cells/l
+df_abund$abundance <- ifelse(df_abund$abundance_type_units=="cells/m3",
+       df_abund$abundance,
+       ifelse(df_abund$abundance_type_units=="cells/ml",
+              df_abund$abundance*1000*1000,
+              ifelse(df_abund$abundance_type_units=="cells/l",
+                     df_abund$abundance*1000,
+                     df_abund$abundance)))
+```
+Get the data into the same format as the CPR so it can be combined
+```{r}
+#work out a short dataset ID
+df_abund <- df_abund %>%
+  dplyr::mutate(cp=sub('-.*', '', contracting_party),
+         inst=sub('\\).*', '', sub('.*\\(', '', contracting_party))) %>%
+  arrange(cp, inst) %>%
+  group_by(cp, inst) %>%
+  dplyr::mutate(dset=as.numeric(factor(dataset_name))) %>%
+  ungroup() %>%
+  dplyr::mutate(data_id=paste(cp, inst, dset, sep="-"))
+
+#save the dataset indices
+df_datasets <- df_abund %>%
+  dplyr::select(cp, inst, dset, data_id, contracting_party, dataset_name) %>%
+  distinct() %>%
+  bind_rows(data.frame(cp="UK",
+                       inst="MBA",
+                       dset=1,
+                       data_id="UK-MBA-1",
+                       contracting_party="UK-Marine Biologicical Association (MBA)",
+                       dataset_name="CPR dataset")) %>%
+  arrange(data_id)
+
+#save the datasets info dataframe
+fwrite(df_datasets, file=paste0(dir_main, "dataset_ids", ".csv"))
+
+df_abund <- df_abund %>%
+  dplyr::select(-cp, -inst, -dset)
+```
+Convert the UK-SAMS data to point (station) rather than distributed so that it is not excluded from the analysis
+```{r, warning=FALSE, include=FALSE}
+if(any(grepl("SAMS", unique(df_abund$data_id)))){
+  
+  df_abund_temp <- df_abund %>%
+    filter(!grepl("SAMS", data_id))
+  
+  df_abund <- df_abund %>%
+    filter(grepl("SAMS", data_id)) %>%
+    group_by(latitude, longitude, date, depth_min, depth_max) %>%
+    dplyr::mutate(hour = as.character(sample(23,1, replace = FALSE)),
+           minute = as.character(sample(59,1, replace = FALSE)),) %>%
+    ungroup() %>%
+    dplyr::mutate(minute = ifelse(nchar(minute)<2, paste0("0", minute), minute)) %>%
+    dplyr::mutate(time = paste(hour, minute, "00", sep=":")) %>%
+    dplyr::select(-c(hour, minute)) %>%
+    dplyr::mutate(longitude = -5.5,
+           latitude = 56.5) %>%
+    bind_rows(df_abund_temp)
+  
+  rm(df_abund_temp)
+    
+}
+```
+Split time and date
+```{r, warning=FALSE}
+#split the date variable into year, month, day
+#format date column
+df_abund$year <- format(df_abund$date, format="%Y")
+df_abund$month <- format(df_abund$date, format="%m")
+df_abund$day <- format(df_abund$date, format="%d")
+
+#split the time variable into hour, minute
+#format time column
+df_abund$time <- ifelse(df_abund$time=="", NA, df_abund$time)
+df_abund$hour <- sub(':.*', '', df_abund$time)
+df_abund$minute <- sub(".*?:",'',df_abund$time)
+df_abund$minute <- sub(':.*', '', df_abund$minute)
+
+#rename variables and order according to the process used for CPR data
+df_abund <- df_abund %>%
+  dplyr::rename("lon"=longitude,
+         "lat"=latitude,
+         "count"=abundance) %>%
+  dplyr::select(data_id,
+         year, month, day, hour, minute, time, lat, lon, size_class, taxon, aphia_id, count)
+```
+Load the CPR data and combine with df_abund
+```{r}
+df_cpr <- read_fst(path=paste0(dir_main, "df_cpr.fst")) %>%
+  dplyr::mutate(size_class = NA,
+         .before="taxon")
+
+df_abund <- df_abund %>%
+  dplyr::select(names(df_cpr))
+
+df_abund <- rbind(df_cpr, df_abund)
+
+rm(df_cpr)
+
+df_abund <- as.data.table(df_abund)
+```
+Match the Master List classifications to the plankton data
+```{r}
+#dataframe containing the lifeform trait criteria
+lf_select <- rbind(data.frame(column1 = "plankton_type", cat1="Phytoplankton",
+                           column2="phytoplankton_type", cat2="Diatom",
+                           name="diatom"),
+data.frame(column1 = "plankton_type", cat1="Phytoplankton",
+                           column2="phytoplankton_type", cat2="Dinoflagellate",
+                           name="dinoflagellate"),
+data.frame(column1 = "phytoplankton_type", cat1="Diatom",
+                           column2="phyto_depth", cat2="Pelagic",
+                           name="pelagic_diatoms"),
+data.frame(column1 = "phytoplankton_type", cat1="Diatom",
+                           column2="phyto_depth", cat2="Tychopelagic",
+                           name="tycho_diatoms"),
+data.frame(column1 = "plankton_type", cat1="Phytoplankton",
+                           column2="phytoplankton_size", cat2="Lg",
+                           name="lg_phyto"),
+data.frame(column1 = "plankton_type", cat1="Phytoplankton",
+                           column2="phytoplankton_size", cat2="Sm",
+                           name="sm_phyto"),
+data.frame(column1 = "copepod", cat1="Y",
+                           column2="cop_size", cat2="Lg",
+                           name="lg_copepods"),
+data.frame(column1 = "copepod", cat1="Y",
+                           column2="cop_size", cat2="Sm",
+                           name="sm_copepods"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_habitat", cat2="Holoplankton",
+                           name="holoplankton"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_habitat", cat2="Meroplankton",
+                           name="meroplankton"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_type", cat2="Fish",
+                           name="fishlarvae"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_diet", cat2=c("Herbivore", "Omnivore", "Ambiguous"),
+                           name="noncarniv"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_diet", cat2="Carnivore",
+                           name="carniv"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="zoo_type", cat2="Crustacean",
+                           name="crustacean"),
+data.frame(column1 = "plankton_type", cat1="Phytoplankton",
+                           column2="plankton_type", cat2="Phytoplankton",
+                           name="phytoplankton"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="copepod", cat2="Y",
+                           name="copepods"),
+data.frame(column1 = "plankton_type", cat1="Zooplankton",
+                           column2="gelatinous", cat2="Y",
+                           name="gelatinous")
+)
+
+#function for selecting the right variables 
+make_lf_df <- function(x, master, lf_select, lf){
+  temp <- lifeformMatch(x=x, master=master,
+                           column1 = lf_select$column1[lf_select$name==lf][1], cat1=lf_select$cat1[lf_select$name==lf][1],
+                           column2=lf_select$column2[lf_select$name==lf][1], cat2=lf_select$cat2[lf_select$name==lf],
+                           name=lf)
+  return(temp)
+}
+
+```
+Tag raw data by lifeform
+```{r}
+tag_lf <- function(x, master, lf){
+  
+  df_temp <- list()
+  for(i in 1:length(unique(lf$name))){
+    temp_lf_name <- sort(unique(lf$name))[i]
+      
+    print(temp_lf_name)
+    
+    temp_lf <- subset(lf, name==temp_lf_name)
+  
+    df_lifeform <- master %>%
+        filter((!!sym(temp_lf$column1[1])) %in% temp_lf$cat1[1]) %>%
+        filter((!!sym(temp_lf$column2[1])) %in% temp_lf$cat2) %>%
+        dplyr::select(size_class, aphia_id) %>%
+        distinct()
+    
+    tf_lf <- data.frame(V1 = as.integer(paste(x$aphia_id, x$size_class) %in% paste(df_lifeform$aphia_id, df_lifeform$size_class)))
+   
+    names(tf_lf) <- temp_lf_name
+    df_temp[[i]] <- tf_lf
+  }
+  sub_output <- do.call(cbind,df_temp)
+  output <- cbind(x, sub_output)
+  return(output)
+}
+
+df_abund_tagged <- tag_lf(x=df_abund, master=df_master, lf=lf_select)
+```
+Append taxon names for taxa with size-class specified
+```{r}
+df_abund_tagged$size_class_name[df_abund_tagged$sm_phyto == 1 & df_abund_tagged$size_class == 2] <- ",Sm"
+df_abund_tagged$size_class_name[df_abund_tagged$lg_phyto == 1 & df_abund_tagged$size_class == 1] <- ",Lg"
+df_abund_tagged$size_class_name[is.na(df_abund_tagged$size_class_name)] <- ""
+
+df_abund_tagged$taxon <- paste0(df_abund_tagged$taxon, df_abund_tagged$size_class_name)
+
+df_abund_tagged$size_class <- NULL
+df_abund_tagged$size_class_name <- NULL
+```
+Aggregate the data by lifeform by sample
+```{r}
+count_lf <- function(x){
+  data_id_list <- list()
+  for(t in 1:length(unique(x$data_id))){
+    
+    data_id_temp <- sort(unique(x$data_id))[t]
+    x_data_id <- as.data.frame(subset(x, data_id==data_id_temp))
+    
+    #isolate relevant lifeforms
+    id_vars <- c("lon", "lat", "assess_id", "data_id", "contracting_party", "dataset_name", "year", "month", "day", "hour", "minute", "count", "taxon", "aphia_id")
+  
+    lifeforms <- sort(colnames(x_data_id)[!(colnames(x_data_id) %in% id_vars)])
+    lifeforms <- colnames(x_data_id[lifeforms][colSums(x_data_id[lifeforms][lifeforms]) > 0])
+    
+    lf_list <- list()
+    for(i in 1:length(unique(lifeforms))){
+    
+      df_lf_mon <- x_data_id %>%
+                    dplyr::filter(get(lifeforms[i])==1) %>%
+                    dplyr::group_by(data_id, lon, lat, year, month, day, hour, minute) %>%
+                    dplyr::summarise(count=sum(count, na.rm=T),
+                                     .groups = 'drop') %>%
+                    dplyr::mutate(lifeform=lifeforms[i]) %>%
+                    arrange(data_id, lifeform, year, month, day, hour, minute)
+
+        
+      lf_list[[i]] <- df_lf_mon
+    }
+    
+    #spread and collapse to ensure proper inclusion of 0s
+    df_data_id <- do.call(rbind, lf_list) %>%
+      pivot_wider(names_from = lifeform, 
+                  values_from = count,
+                  values_fill = 0) %>%
+      pivot_longer(-c("data_id", "year", "month", "day", "hour", "minute", "lat", "lon"), names_to = "lifeform", values_to = 'count')
+    
+    data_id_list[[t]] <- df_data_id
+  }
+  output <- do.call(rbind, data_id_list)
+  return(output)
+}
+
+df_abund_agg <- count_lf(x=df_abund_tagged)
+```
+Replace 0 values with 0.5* the min value for the data_id/lifeform combination so data can be log transformed
+```{r}
+df_abund_agg <- df_abund_agg %>%
+  group_by(data_id, lifeform) %>%
+  dplyr::mutate(min_non_zero = min( count[count!=min(count)] )) %>%
+  dplyr::mutate(count = count + min_non_zero*0.5) %>%
+  ungroup() %>%
+  dplyr::select(-min_non_zero)
+```
+Save the formatted data for ease of use rather than preparing the data each time it is needed
+```{r}
+#create data output directory
+output_path <- paste0(dir_main, "Plankton_processed/")
+dir.create(file.path(output_path), showWarnings = FALSE)
+
+write_fst(df_abund_tagged, path=paste0(output_path, "plankton_by_taxon.fst"))
+write_fst(df_abund_agg, path=paste0(output_path, "plankton_by_lifeform.fst"))
+```
+
+
+
+
+

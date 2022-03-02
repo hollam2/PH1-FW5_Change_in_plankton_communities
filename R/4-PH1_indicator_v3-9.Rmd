@@ -1,0 +1,1460 @@
+---
+title: "PH1 Indicator from plankton data tool"
+---
+
+This tool reads processed plankton abundance data that has been converted into a time-series with gaps filled by extracting by shapefile polygons from the IDW interpolated rasters and performs the pelagic indicator assessment.
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 1 March 2022
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+#enter a rough bounding box for visualisation only (in decimal degrees format)
+north <- 64
+west <- -16
+east <- 14
+south <- 34
+
+#reference period duration (in years)
+ref_per <- 5
+
+#enter the range of years covered by this analysis, the reference and comparison period will be calculated as the first n and the last n years of the dataset, with n determined by "ref_per" the variable
+start_query <- 1960
+end_query <- 2019
+
+#set threshold for minimum number of months out of the year required for a shapefile to be included
+mon_thr <- 8
+
+#set the threshold for the proportion of years that must be represented in a dataset
+thr <- 0.5
+
+#enter the file directory path for the shapefile the data is partitioned with
+path_shp_part <- "../Data_raw/COMP4_assessment_areas_v7e/"
+
+#enter the filename of the shapefile the data is partitioned with
+file_shp_part <- "COMP4_assessment_areas_v7e.shp"
+
+#provide the name of the variable in the shapefile used for separating the assessment areas
+assess_des <- "LongName"
+
+#enter the main directory to use to access the processed data
+dir_main <- "../Data_processed/"
+
+#enter the directory where raw data is stored
+dir_raw <- "../Data_raw/"
+
+#enter the main directory to use to store image outputs
+dir_out <- "../Output/"
+
+#create plot output directory
+output_path <- paste(dir_out, gsub(".shp", "", file_shp_part), "/", sep="")
+dir.create(file.path(output_path), showWarnings = FALSE)
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+
+#install rnaturalearthhires for map data
+devtools::install_github("ropensci/rnaturalearthhires")
+
+list.of.packages <- c("plyr", "dplyr", "ggplot2", "ggpubr", "data.table", "tidyverse", "sf", "lemon", "viridis", "broom", "EnvStats", "gridExtra", "pracma", "ggpattern", "colorspace", "vegan", "cowplot", "fst")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages, new.packages)
+
+options(scipen=999)
+
+#switch off spherical geometry
+sf::sf_use_s2(FALSE)
+```
+Create output directory for figures if not already present
+```{r}
+#generate directory for processed data
+dir.create(file.path(dir_out), showWarnings = FALSE)
+```
+Generate string for the relevant subdirectory 
+```{r}
+#save the data as fst
+dir_shp <- paste0(dir_main, gsub(".shp","",file_shp_part), "/")
+
+#generate a string for the directory of the relevant CSV file
+file_path <- paste0(dir_shp, gsub(".shp", "", file_shp_part), "_lifeforms", ".fst")
+
+#read in the data
+df <- read_fst(file_path) %>%
+  filter(year >= start_query & year <= end_query) %>%#subset dataset to the year range of the analysis
+  dplyr::mutate(month=ifelse(nchar(month)==1, paste0( 0,month),month)) %>%
+  group_by(data_id, assess_id) %>% #ensure only data is available for assessment areas with real samples
+  filter(sum(n) > 0) %>%
+  ungroup() %>%
+  group_by(data_id) %>%
+  filter(max(year) > (end_query - ref_per) &
+           min(year) < (end_query - ref_per)) %>%
+  ungroup()
+
+```
+Exclude PH2 indicator data and lifeforms which are not accurately represented in CPR data
+```{r}
+#exclude copepods group, as this is PH2, and exclude any sm_phyto and gelatinous from CPR 
+df <- df %>%
+  filter(lifeform != "copepods") %>%
+  filter(!(grepl("MBA", data_id) & grepl("sm_phyto", lifeform))) %>%
+  filter(!(grepl("MBA", data_id) & grepl("gelatinous", lifeform))) %>%
+  filter(!(grepl("IPMA", data_id) & grepl("lg_phyto", lifeform))) %>%
+  filter(!(grepl("IPMA", data_id) & grepl("pelagic_diatoms", lifeform))) %>%
+  filter(!(grepl("IPMA", data_id) & grepl("phytoplankton", lifeform)))
+```
+Expand to include all months in each dataset
+```{r, include=FALSE}
+expand_months <- function(x){
+output_list <- list()
+for(i in 1:length(unique(x$data_id))){
+  
+  data_id_temp <- sort(unique(x$data_id))[i]
+  
+  df_temp <- subset(x, data_id == data_id_temp)
+  
+  year_range <- range(df_temp$year)
+  
+  month_min <- df_temp %>%
+    filter(year==all_of(year_range[1])) %>%
+    dplyr::summarise(month_min = min(as.numeric(month)))
+  
+  month_max <- df_temp %>%
+    filter(year==all_of(year_range[2])) %>%
+    dplyr::summarise(month_max = max(as.numeric(month)))
+  
+  #create sequence of months
+  month <- seq(1,12,1)
+  year <- seq(year_range[1], year_range[2], 1)
+  
+  dates <- expand.grid(data_id=unique(df_temp$data_id), lifeform=unique(df_temp$lifeform), assess_id=unique(df_temp$assess_id), year=year, month=month) %>%
+    arrange(data_id, lifeform, assess_id, year, month)
+  
+  dates$month <- ifelse(dates$year == year_range[1] & dates$month < month_min$month_min[1],NA,dates$month)
+  dates$month <- ifelse(dates$year == year_range[2] & dates$month > month_max$month_max[1],NA,dates$month)
+
+  dates <- dates %>%
+    filter(!is.na(month)) %>%
+    dplyr::mutate(across(everything(), as.character)) %>%
+    dplyr::mutate(month=ifelse(nchar(month)==1,paste0(0,month),month)) %>%
+    left_join(df_temp) %>%
+    arrange(data_id, lifeform, assess_id, year, month)
+  
+  dates$n[is.na(dates$n)] <- 0
+  dates
+  dates$is_point <- df_temp$is_point[match(dates$data_id, df_temp$data_id)]
+  
+  output_list[[i]] <- dates
+}
+final_output <- do.call(rbind, output_list)
+return(final_output)
+}
+
+df <- expand_months(df)
+```
+Quality control steps from Bedford et al. (2020) GCB. Display boxplot of proportion of years removed from each spatial unit.
+```{r}
+#remove years from time series with less than n months of interpolated data and determine proportion of years removed
+clean_years <- function(x){
+  temp <- x %>%
+    group_by(data_id, assess_id, lifeform) %>%
+    dplyr::mutate(orig_year = length(unique(year))) %>% #count number of years per cell in the original data
+    ungroup() %>%
+    filter(!is.na(count)) %>%
+    group_by(data_id, assess_id, lifeform, year) %>% 
+    dplyr::mutate(n=n()) %>% #count number of months of data within each year per cell
+    ungroup() %>%
+    filter(n < mon_thr) %>% #extract years with less than n months of real data
+    group_by(data_id, assess_id, lifeform) %>%
+    dplyr::mutate(prop_years_removed = length(unique(year)) / orig_year) %>% #determine proportion of years of data removed per grid cell
+    ungroup()
+  return(temp)
+}
+
+df_years <- clean_years(x=df)
+
+#show proportion of years removed
+boxplot(df_years$prop_years_removed)
+```
+Interpolation steps from Bedford et al. (2020) GCB
+```{r}
+#function for filling month gaps in the time series
+fill_gaps <- function(x, y){
+  df_fill <- anti_join(x, y, by=c("data_id", "year","assess_id"))
+
+  #arrange the data to allow for NA interpolation across time
+  df_fill <- df_fill %>% 
+    arrange(data_id, lifeform, assess_id, year, month) %>%
+    group_by(data_id, lifeform, assess_id) %>%
+    dplyr::mutate(count_interp = zoo::na.approx(count, maxgap = 3, rule = 2)) %>%
+    ungroup()
+  return(df_fill)
+}
+
+df_fill <- fill_gaps(x=df, y=df_years)
+rm(df_years)
+
+#tally NA rows for checking how well the interpolation performed
+colSums(is.na(df_fill))
+```
+Replace the old data with the new interpolated data
+```{r}
+#replace original dataframe with interpolated data
+df <- df_fill %>%
+  dplyr::select(data_id, lifeform, year, month, assess_id, count, count_interp, n, rmse_idw, n_idw, is_point) %>%
+  filter(!is.na(count_interp))
+rm(df_fill)
+```
+Save the processed, cleaned and na.approximated dataset
+```{r}
+write_fst(df, path=paste0(gsub(".fst", "", file_path), "_processed", ".fst"))
+```
+Load the PH1 indicator code developed by Anthony Ndah
+```{r}
+#load the PH1 functions into the global environment
+source("Supporting_scripts/new_20062021.R")
+```
+Arrange the reference (contemporary) data into the appropriate format (two-column dataframe) to calculate the lifeform pairs indicator
+```{r}
+#create dataframe of lifeform pair comparisons of interest for this data
+df_lf <- data.frame()
+df_lf[1,1:2] <- c("diatom", "dinoflagellate")
+df_lf[2,1:2] <- c("tycho_diatoms", "pelagic_diatoms")
+df_lf[3,1:2] <- c("lg_copepods", "sm_copepods")
+df_lf[4,1:2] <- c("holoplankton", "meroplankton")
+df_lf[5,1:2] <- c("lg_phyto", "sm_phyto")
+df_lf[6,1:2] <- c("phytoplankton", "noncarniv")
+df_lf[7,1:2] <- c("crustacean", "gelatinous")
+df_lf[8,1:2] <- c("gelatinous", "fishlarvae")
+
+#rearrange long format reference period data to wide format for relevant lifeforms
+dataSelect <- function(x, lf, lims){
+  refData <- x %>%
+    group_by(data_id, assess_id) %>%
+    filter(sum(n) > 0) %>%
+    ungroup() %>%
+    dplyr::select(data_id, lifeform, year, month, assess_id, count_interp, n) %>%
+    filter(lifeform %in% as.vector(unlist(lf)),
+           year>=lims[1] & year<=lims[2]) %>%
+    ungroup() %>%
+    pivot_wider(names_from = lifeform, values_from = count_interp)
+  return(refData)
+}
+```
+Define the comparison and the reference period and select the relevant data
+```{r}
+#define reference period
+refStart <- end_query - (ref_per - 1)
+refStop <- end_query
+
+#define comparison period
+compStart <- min(df$year)
+compStop <- refStart - 1
+
+refData <- dataSelect(x=df, lf=df_lf, lims=c(refStart, refStop))
+compData <- dataSelect(x=df, lf=df_lf, lims=c(1900, compStop))
+
+#exclude datasets that are not represented in both reference and comparison data
+data_id_include <- intersect(refData$data_id, compData$data_id)
+refData <- subset(refData, data_id %in% data_id_include)
+compData <- subset(compData, data_id %in% data_id_include)
+
+#exclude spatial units that are not represented in both reference and comparison data
+id_include <- intersect(refData$assess_id, compData$assess_id)
+refData <- subset(refData, assess_id %in% id_include)
+compData <- subset(compData, assess_id %in% id_include)
+
+#create title reference string for labeling plots and files later in code
+years_label <- paste0("Ref: " , refStart, "-", refStop, ",", " Comp: ", compStart, "-", compStop)
+years_label_simp <- janitor::make_clean_names(years_label)
+```
+Calculate the lifeform pairs indicator reference envelope for each spatial unit in the dataset
+```{r}
+#function to prepare the reference envelopes for the multiple lifeform pairs comparisons
+find_envAll <- function(x, lf){
+ data_id_outer <- data.frame()
+ data_id_inner <- data.frame()
+  for(t in 1:length(unique(x$data_id))){
+    
+    temp_data_id <- sort(unique(x$data_id))[t]
+    
+    #determine relevant lifeform pairs for the dataset
+    x_data_id <- x %>%
+      filter(data_id == all_of(temp_data_id))
+    
+    #find the relevant lifeform pairs
+    x_data_id <- x_data_id[,colSums(is.na(x_data_id))<nrow(x_data_id)]
+    
+    lf_data_id <- lf %>%
+      filter(V1 %in% all_of(colnames(x_data_id)),
+             V2 %in% all_of(colnames(x_data_id)))
+    
+    main_outer <- data.frame()
+    main_inner <- data.frame()
+    for(i in 1:nrow(lf_data_id)){
+      temp_lf <- as.vector(unlist(lf_data_id[i,]))
+      
+      temp_x <- x_data_id %>%
+        dplyr::select(assess_id, all_of(temp_lf))
+      
+      assess_id_list <- sort(unique(temp_x$assess_id))
+      
+      df_outer <- data.frame()
+      df_inner <- data.frame()
+      for(j in 1:length(assess_id_list)){
+        temp_pair <- subset(temp_x, assess_id == assess_id_list[j])
+        
+        #command to skip envelope fitting for data with no variance
+        abort <- ifelse(sd(as.vector(unlist(temp_pair[,2]))) == 0 | sd(as.vector(unlist(temp_pair[,3])))==0, TRUE, FALSE)
+        
+        if(abort==FALSE){
+        
+          envPts <- findEvn(as.vector(unlist(temp_pair[,2])),
+                            as.vector(unlist(temp_pair[,3])),
+                            p=0.9,
+                            sc=TRUE)
+          envPts_unlist <- rbindlist(envPts, fill=TRUE)
+          temp_outer <- data.frame(outX=envPts_unlist$outX[complete.cases(envPts_unlist$outX)],
+                                 outY=envPts_unlist$outY[complete.cases(envPts_unlist$outY)],
+                                 assess_id = assess_id_list[j])
+          temp_inner <- data.frame(inX=envPts_unlist$inX[complete.cases(envPts_unlist$inX)],
+                                 inY=envPts_unlist$inY[complete.cases(envPts_unlist$inY)],
+                                 assess_id = assess_id_list[j])
+          
+          df_outer <- rbind(df_outer, temp_outer)
+          df_inner <- rbind(df_inner, temp_inner)
+        }
+      }
+      
+      if(nrow(df_outer) > 0 & nrow(df_inner) > 0){
+      
+        df_outer$lf_pair <- paste(temp_lf, collapse="-")
+        df_inner$lf_pair <- paste(temp_lf, collapse="-")
+        
+        df_outer$data_id <- temp_data_id
+        df_inner$data_id <- temp_data_id
+        
+        main_outer <- rbind(main_outer, df_outer)
+        main_inner <- rbind(main_inner, df_inner)
+      
+      }
+    }
+  data_id_outer <- rbind(data_id_outer, main_outer)
+  data_id_inner <- rbind(data_id_inner, main_inner)
+  }
+  main_list <- list(data_id_outer, data_id_inner)
+  return(main_list)
+}
+
+envAll <- find_envAll(x=refData, lf=df_lf)
+```
+Calculate the lifeform pairs indicator
+```{r}
+#function to find the lifeform pairs indicator from the reference envelopes and comparison data
+PIcalcAll <- function(x, y, z, lf){
+
+    main_outer <- x[[1]]
+    main_inner <- x[[2]]
+    
+    main_outer <- main_outer %>%
+      filter(data_id %in% all_of(y$data_id))
+    
+    main_inner <- main_inner %>%
+      filter(data_id %in% all_of(y$data_id))
+    
+    #subset to individual dataset
+    output_list <- list()
+    for(t in 1:length(unique(main_outer$data_id))){
+      
+      data_id_temp <- sort(unique(main_outer$data_id))[t]
+      
+      main_outer_data_id <- subset(main_outer, data_id == data_id_temp)
+      main_inner_data_id <- subset(main_inner, data_id == data_id_temp)
+        
+      main_output <- data.frame()
+      for(i in 1:length(unique(main_outer_data_id$lf_pair))){
+        temp_lf <- unlist(strsplit(sort(unique(main_outer_data_id$lf_pair))[i], "-"))
+        
+        df_outer <- subset(main_outer_data_id, lf_pair == paste(temp_lf, collapse="-"))
+        df_inner <- subset(main_inner_data_id, lf_pair == paste(temp_lf, collapse="-"))
+        
+        df_y <- y %>%
+          filter(data_id==sort(unique(main_outer$data_id))[t]) %>%
+          dplyr::select(assess_id, temp_lf)
+        
+        df_z <- z %>%
+          filter(data_id==sort(unique(main_outer$data_id))[t]) %>%
+          dplyr::select(assess_id, temp_lf)
+        
+        
+        assess_ids <- intersect(unique(df_y$assess_id), unique(df_z$assess_id))
+
+        piList <- data.frame()
+        for(j in 1:length(assess_ids)){
+        
+          assess_id_temp <- assess_ids[j]
+            
+          temp_outer <- subset(df_outer, assess_id == assess_id_temp)
+          temp_inner <- subset(df_inner, assess_id == assess_id_temp)
+          temp_y <- subset(df_y, assess_id == assess_id_temp)
+          
+          #arrange the envelope data back into a list
+          envelopePts <- list("EnvOuter"=data.frame("outX" = temp_outer$outX,"outY"=temp_outer$outY),
+                        "EnvInner"=data.frame("inX" = temp_inner$inX,"inY" = temp_inner$inY))
+          
+          compDat <- data.frame(y1 = as.vector(unlist(temp_y[,2])),
+                     y2 = as.vector(unlist(temp_y[,3])))
+          
+          #add labelling variables to PI results dataframe
+          df_refPoints <- df_z %>%
+          group_by(assess_id) %>%
+          dplyr::summarise(refPoints = n())
+    
+          #command to skip envelope fitting for data with no reference envelope
+          abort <- ifelse(nrow(envelopePts[[1]]) == 0 & nrow(envelopePts[[2]]) == 0, TRUE, FALSE)
+          
+          if(abort==FALSE){
+            piPts <- PIcalc(compDat, envelopePts, 0.9)
+            piPts <- do.call(cbind.data.frame, piPts)
+            piPts$assess_id <- assess_id_temp
+            piPts$refPoints <- df_refPoints$refPoints[1]
+            
+            piList <- rbind(piList, piPts)
+          }
+      }
+    
+    piList$lf_pair <- paste(temp_lf, collapse="-")
+    main_output <- rbind(main_output, piList)
+    }
+    
+    main_output <- dplyr::rename(main_output, binomialProbability = 'binomial probability')
+    #main_output <- merge(main_output, df_refPoints, by="assess_id")
+    main_output$data_id <- data_id_temp
+    
+    output_list[[t]] <- main_output
+    }
+    output_final <- do.call(rbind, output_list)
+    return(output_final)
+  }
+
+piResults <- PIcalcAll(x=envAll, y=compData, z=refData, lf=df_lf)
+```
+Plot the results for the PI for each envelope
+```{r}
+#function for plotting the PI envelope
+plot_env <- function(x, y, z, lf, pi, label, threshold){
+  
+  #rounding function for labelling
+  specify_decimal <- function(x, k) trimws(format(round(x, k), nsmall=k))
+  
+  refs <- y %>%
+    group_by(data_id, assess_id) %>%
+    dplyr::summarise(refStart=min(year),
+              refStop=max(year)) %>%
+    ungroup()
+  
+  comps <- z %>%
+    group_by(data_id, assess_id) %>%
+    dplyr::summarise(compStart=min(year),
+              compStop=max(year)) %>%
+    ungroup()
+  
+  df_lookup_main <- data.frame(data_id = pi$data_id, assess_id = pi$assess_id, lf_pair=pi$lf_pair) %>%
+    left_join(refs, by = c("data_id", "assess_id")) %>%
+    left_join(comps, by = c("data_id", "assess_id")) %>%
+    dplyr::mutate(years_label = paste0("Ref: " , refStart, "-", refStop, ",", " Comp: ", compStart, "-", compStop))
+  
+  #create labeller lookup table
+  df_lookup_main$string <- paste0(pi$assess_id, '\n',
+                'PI: ', specify_decimal(pi$PI, 2), ' ',
+                df_lookup_main$years_label,'\n',
+                'ref points: ', pi$refPoints, ',', ' ',
+                'comp points: ', pi$newPoints,',', ' ',
+                'binom-p: ', specify_decimal(pi$binomialProbability, 4), ',', ' ',
+                'chi-sq: ', specify_decimal(pi$chi.sq, 1))
+  
+  main_outer <- x[[1]]
+  main_inner <- x[[2]]
+  
+  data_id_plot_list <- list()
+  for(t in 1:length(unique(main_outer$data_id))){
+    
+    data_id_temp <- sort(unique(df_lookup_main$data_id))[t]
+    
+    main_outer_data_id <- subset(main_outer, data_id == data_id_temp)
+    main_inner_data_id <- subset(main_inner, data_id == data_id_temp)
+
+    plot_list <- list()
+    for(i in 1:length(unique(main_outer_data_id$lf_pair))){
+      
+      temp_lf <- unlist(strsplit(sort(unique(main_outer_data_id$lf_pair))[i], "-"))
+
+      df_outer <- subset(main_outer_data_id, lf_pair == paste(temp_lf, collapse="-"))
+      df_inner <- subset(main_inner_data_id, lf_pair == paste(temp_lf, collapse="-"))
+      
+      names(df_outer)[1:2] <- c("x", "y")
+      names(df_inner)[1:2] <- c("x", "y")
+  
+      df_outer$subid <- 1L
+      df_inner$subid <- 2L
+      df_polys <- rbind(df_outer, df_inner)
+    
+      temp_ref <- y %>% dplyr::select(1:4, temp_lf) %>%
+        filter(data_id == data_id_temp) %>%
+        arrange(data_id, assess_id, year, month)
+      names(temp_ref)[c(ncol(temp_ref)-1,ncol(temp_ref))] <- c("vx", "vy")
+      
+      temp_comp <- z %>% dplyr::select(1:4, temp_lf) %>%
+        filter(data_id == data_id_temp) %>%
+        arrange(data_id, assess_id, year, month)
+      names(temp_comp)[c(ncol(temp_comp)-1,ncol(temp_comp))] <- c("vx", "vy")
+      
+      #check that polygons are above the threshold number of years represented in the time series
+      year <- rbind(temp_comp, temp_ref) %>%
+        dplyr::select(data_id, assess_id, year) %>%
+        distinct() %>%
+        group_by(assess_id) %>%
+        dplyr::mutate(prop_years = length(unique(year) %in% seq(min(year), max(year), 1)) / length(seq(min(year), max(year), 1))) %>%
+        ungroup() %>%
+        filter(prop_years >= threshold)
+      
+      ids <- intersect(unique(temp_ref$assess_id),unique(temp_comp$assess_id))
+  
+      #grouping factor for colouring months
+      temp_comp$month <- as.numeric(temp_comp$month)
+      temp_comp$season <- ifelse(temp_comp$month %in% c(1, 2, 12), "months: 1 2 12",
+                                 ifelse(temp_comp$month %in% c(3, 4, 5), "months: 3 4 5",
+                                        ifelse(temp_comp$month %in% c(6, 7, 8), "months: 6 7 8",
+                                               ifelse(temp_comp$month %in% c(9, 10, 11), "months: 9 10 11", "ERROR"))))
+      
+      #Create a custom color scale
+      factor_levels <- unique(temp_comp$season)
+      myColors <- c("blue", "green", "yellow", "red")
+      names(myColors) <- levels(factor_levels)
+      
+      #subset lookup table to panel of relevance
+      df_lookup_temp <- unique(subset(df_lookup_main, data_id == data_id_temp & 
+                                        lf_pair == paste(temp_lf, collapse="-")))
+      
+      #create title reference string
+      years_label <- paste0("Ref: " , df_lookup_temp$refStart[1], "-", df_lookup_temp$refStop[1], ",", 
+                            " Comp: ", df_lookup_temp$compStart[1], "-", df_lookup_temp$compStop[1])
+      df_lookup_temp <- setNames(df_lookup_temp$string, df_lookup_temp$assess_id)
+      
+      sub_plot_list <- list()
+      for(j in 1:length(ids)){
+        
+        poly <- ids[j]
+      
+        gg_panel <- ggplot() +
+          geom_polygon(data=subset(df_polys, assess_id == poly), aes(x, y, group = assess_id, subgroup = subid), fill="grey60", colour="black", size=0.25, alpha=0.5) +
+          geom_path(data=subset(temp_comp, assess_id == poly), aes(x=vx, y=vy), colour="grey", linetype = 2, size=0.25) +
+          geom_point(data=subset(temp_comp, assess_id == poly),aes(x=vx, y=vy, fill=season), shape=21) +
+          geom_point(data=subset(temp_ref, assess_id == poly),aes(x=vx, y=vy), shape=21, fill=NA, colour="grey60", alpha=0.5) +
+          scale_x_continuous(name=bquote(log[10]* "(" * .(temp_lf[1]) * ")")) +
+          scale_y_continuous(name=bquote(log[10]* "(" * .(temp_lf[2]) * ")")) +
+          scale_fill_manual(values=myColors)+
+          facet_wrap(~ assess_id, scales="free", labeller = labeller(assess_id=df_lookup_temp)) +
+          theme_bw() +
+          theme(plot.title = element_text(hjust = 0.5),
+              legend.title = element_blank(),
+              legend.position = "none")
+       
+        sub_plot_list[[poly]] <- gg_panel 
+      }
+      plot_list[[paste(temp_lf, collapse="-")]] <- sub_plot_list
+    }
+    data_id_plot_list[[data_id_temp]] <- plot_list
+  }
+  return(data_id_plot_list)
+}
+
+#run the function
+env_plots <- plot_env(x=envAll, y=refData, z=compData, lf=df_lf, pi=piResults, label=years_label, threshold=thr)
+```
+Model change in lifeforms over time with Kendall test
+```{r}
+kendallAll <- function(x){
+  #generate relevant dataset within year limits
+  trajData <- x
+  
+  #model annual change in abundance of each group in each spatial unit
+  df_fits_tot <- trajData %>%
+    dplyr::select(data_id, assess_id, year, month, n, lifeform, count_interp) %>%
+    group_by(data_id, assess_id, year, lifeform) %>%
+    dplyr::summarise(nSamples = sum(n, na.rm=T),
+      count_mean = mean(count_interp, na.rm=T)) %>%
+    ungroup() %>%
+    filter(!is.nan(count_mean)) %>%
+    group_by(data_id, assess_id, lifeform) %>%
+    dplyr::mutate(count = n()) %>%
+    filter(count >= 3) %>%
+    dplyr::mutate(year=as.integer(year)) %>%
+    do(fits = tidy(kendallTrendTest(count_mean ~ year, ci.slope=FALSE, data=.))) %>% 
+    unnest(fits)
+  
+  #column to code whether p-value is significant
+  df_fits_tot$sig <- ifelse(df_fits_tot$p.value <= 0.05, TRUE, FALSE)
+  
+  #simplify the dataframe output
+  df_fits_tot <- data.frame(data_id = df_fits_tot$data_id,
+                            assess_id = df_fits_tot$assess_id,
+                            lifeform = df_fits_tot$lifeform,
+                            statistic = df_fits_tot$statistic,
+                            p = df_fits_tot$p.value,
+                            sig = df_fits_tot$sig) %>%
+    arrange(data_id, assess_id, lifeform)
+  return(df_fits_tot)
+}
+
+df_fits_tot <- kendallAll(x=df)
+```
+Prepare data to view time-series for lifeform groups by spatial unit
+```{r, warning=FALSE}
+createTS <- function(x, y, limits, threshold, ids){
+  
+  #generate relevant dataset within year limits
+  trajData <- x
+  
+  #match model results to new plotting dataframe
+  df_plot <- merge(trajData, y, by=c("data_id", "assess_id", "lifeform"))
+  
+  #convert year and month variables to date format
+  df_plot$date_mon <- as.Date(paste(df_plot$year, df_plot$month, 15), "%Y %m %d")
+  df_plot$date_year <- as.Date(paste(df_plot$year, 07, 02), "%Y %m %d")
+  
+  #tally number of samples for each facet
+  df_plot <- df_plot %>%
+    dplyr::mutate(year=as.integer(year)) %>%
+    filter(!is.na(count_interp)) %>%
+    group_by(data_id, lifeform, assess_id) %>%
+    dplyr::mutate(sumSamples = sum(n, na.rm=T),
+           prop_years = length(unique(year) %in% seq(min(year), max(year), 1)) / length(seq(min(year), max(year), 1))) %>%
+    ungroup() #ensure that threshold number of samples are included in each dataset
+
+  #remove all spatial units which are not represented in the reference and comparison data
+  df_plot <- subset(df_plot, assess_id %in% ids)
+
+  return(df_plot)
+}
+
+df_plot <- createTS(x=df, y=df_fits_tot, threshold=thr, ids=id_include)
+```
+Generate the plots for lifeform abundance over time
+```{r}
+plot_ts <- function(x, threshold){
+  
+  #calculate a mean RMSE for extracted time series (not relevant for point data)
+  rmse_temp <- x %>%
+    filter(!is.na(rmse_idw)) %>%
+    filter(n==0) %>%
+    dplyr::mutate(rmse_a = rmse_idw^2) %>%
+    group_by(data_id, assess_id, lifeform) %>%
+    dplyr::mutate(rmse_c = sum(rmse_a),
+           n_rmse = n()) %>%
+    ungroup() %>%
+    dplyr::mutate(rmse_d = rmse_c / n_rmse,
+           rmse_mean = sqrt(rmse_d)) %>%
+    dplyr::select(data_id, assess_id, lifeform, rmse_mean, is_point)
+  
+  #exclude the 0 RMSE values for point datasets. Code as NA instead.  
+  rmse_temp$rmse_mean[rmse_temp$is_point] <- NA
+    
+  #create labeller lookup table
+  df_lookup_main <- data.frame(data_id = x$data_id, assess_id = x$assess_id, lifeform=x$lifeform) %>%
+    dplyr::mutate(string = paste0(x$assess_id, '   ', 
+                'z: ', round(x$statistic, 2), '   ', 
+                'p: ', ifelse(x$p <= 0.05, "<=0.05", round(x$p,3)), '  ',
+                'n: ', x$sumSamples, '  ',
+                'RMSE: ', round(rmse_temp$rmse_mean, 2))) %>%
+    distinct()
+  
+  data_id_list <- list()
+  for(t in 1:length(unique(x$data_id))){
+    
+    #remove all trajectories for spatial units with less than the threshold number of samples
+    x <- subset(x, prop_years >= threshold)
+    
+    data_id_temp <- sort(unique(x$data_id))[t]
+  
+    x_data_id <- subset(x, data_id == data_id_temp)
+    
+    plot_list <- list()
+    for (i in 1:length(unique(x_data_id$lifeform))){
+      
+      lf_temp <- sort(unique(x_data_id$lifeform))[i]
+      
+      #subset to polygon of interest
+      df_lookup_temp <- unique(subset(df_lookup_main, data_id == data_id_temp & lifeform == lf_temp))
+      
+      #filter to polygon of interest and plot results 
+      temp <- x_data_id %>%
+        filter(lifeform == lf_temp)
+      
+      sub_plot_list <- list()
+      for(j in 1:length(unique(temp$assess_id))){
+        
+        assess_id_temp <- sort(unique(temp$assess_id))[j]
+        
+        #subset to polygon of interest
+        df_lookup_temp_id <- unique(subset(df_lookup_temp, assess_id == assess_id_temp))
+        df_lookup_temp_id <- setNames(df_lookup_temp_id$string, df_lookup_temp_id$assess_id)
+        
+        temp_params <- temp %>%
+          filter(assess_id == assess_id_temp) %>%
+          dplyr::select(year, count_interp)
+        
+        years <- c(min(temp_params$year),max(temp_params$year))
+        years_brk <- ifelse(plyr::round_any(years[2],5,f=ceiling)-plyr::round_any(years[1],5,f=floor) <= 20, "2 years", "5 years")
+  
+        years <- seq.Date(from = as.Date(paste(plyr::round_any(years[1],5,f=floor),"01","01",sep="-")), 
+                  to = as.Date(paste(plyr::round_any(years[2],5,f=ceiling)+1,"01","01",sep="-")), 
+                  by = years_brk)
+        
+        y_bks <- if(max(temp_params$count_interp)>=3){
+          seq(0,10,1)
+          }else if(max(temp_params$count_interp)<3 & max(temp_params$count_interp)>1){
+          seq(0,10,0.5)  
+          }else{
+          seq(0,10,0.2)
+          }
+        
+        gg_panel <- temp %>%
+          filter(assess_id == assess_id_temp) %>%
+          group_by(year) %>%
+          dplyr::mutate(count_annual = mean(count_interp, na.rm=T)) %>%
+          ungroup() %>%
+          dplyr::mutate(interp=ifelse(n==0,TRUE,FALSE)) %>%
+          arrange(year, month) %>%
+          ggplot(.,aes(date_mon, count_interp, colour=interp))+
+          geom_path(aes(group=1),size=0.25)+
+          geom_smooth(aes(date_year, count_annual), formula= y ~ x,
+                      linetype="dashed", colour="black", 
+                      method = 'lm', se = FALSE) +
+          geom_line(aes(date_year, count_annual), colour="blue", size=1)+
+          geom_point(aes(date_year, count_annual), shape=21, fill="blue")+
+          facet_wrap(~assess_id, ncol=1, scales="free_y", labeller = labeller(assess_id=df_lookup_temp_id))+
+          scale_x_date(breaks = years, date_labels = "%Y",
+                       minor_breaks = NULL)+
+          scale_y_continuous(name=bquote(log[10]* "(" * .(lf_temp) * ")"), minor_breaks = NULL, breaks=y_bks)+
+          scale_colour_manual(values=c("TRUE"="grey","FALSE"="blue"))+
+          guides(shape="none")+
+          theme_bw()+
+          theme(plot.title = element_text(hjust = 0.5),
+                axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+               axis.title.x = element_blank(),
+               legend.position = "none")
+        
+        sub_plot_list[[assess_id_temp]] <- gg_panel
+      }
+      plot_list[[lf_temp]] <- sub_plot_list
+    }
+  data_id_list[[data_id_temp]] <- plot_list
+  }
+  return(data_id_list)
+}
+
+ts_plots <- plot_ts(x=df_plot, threshold=thr)
+```
+Load map data
+```{r}
+#load shapefile of European landmass for display
+coast <- rnaturalearth::ne_countries(returnclass = "sf", scale = "large")
+
+#load the shapefile associated with the data
+shp_part <- st_read(paste(path_shp_part, file_shp_part, sep=""))
+
+#choose the variable to use as the primary separator of assessment areas
+shp_part$assess_id <- shp_part[[assess_des]]
+```
+Find centroids of the river plumes for plotting them as symbols
+```{r}
+#create sf object for points
+plume_list <- shp_part %>%
+    dplyr::select(assess_id, geometry) %>%
+    distinct() %>%
+    filter(grepl("plume",tolower(assess_id))) %>%
+    dplyr::mutate(geometry = st_transform(geometry, 2163)) %>%
+    dplyr::mutate(coords = st_centroid(geometry)) %>%
+    dplyr::mutate(geometry = NULL) %>%
+    dplyr::mutate(coords = st_transform(coords, 4326)) %>%
+    unnest_wider(coords) %>%
+    dplyr::mutate(is_point=F)
+
+colnames(plume_list)[2:3] <- c("mean_lon", "mean_lat")
+```
+Generate reference maps for plots
+```{r}
+#import point coordinates of datasets
+df_datasets <- fread(file=paste0(dir_main, "dataset_ids_and_point_id.csv"))
+
+assess_id_list <- df %>%
+    dplyr::select(data_id, assess_id, is_point)%>%
+    distinct() %>%
+    left_join(data.frame(data_id = df_datasets$data_id, 
+                         mean_lat = df_datasets$mean_lat, 
+                         mean_lon = df_datasets$mean_lon), 
+                          by="data_id") %>%
+  dplyr::select(-data_id)%>%
+  arrange(is_point) %>%
+  filter(!grepl("plume", assess_id)) %>%
+  dplyr::select(colnames(plume_list)) %>%
+  bind_rows(plume_list)
+
+
+highlight_poly <- function(x, shp, base_map, lims){
+  
+  map_id_list <- list()
+  for(i in 1:length(unique(x$assess_id))){
+    
+  assess_id_temp <- sort(unique(x$assess_id))[i]
+  
+  assess_id_temp_df <- assess_id_list %>% filter(assess_id == assess_id_temp)
+  
+  #generate the plot output
+  gg_panel <- ggplot()+
+    geom_sf(data=shp, colour="grey80", fill="white", lwd = 0.1)+
+    geom_sf(data=base_map, inherit.aes=F, fill="grey80", colour="grey40", lwd = 0.2)+
+    {if(assess_id_temp_df$is_point[1]==F)geom_sf(data=subset(shp, assess_id==assess_id_temp_df$assess_id[1]), fill="red", colour="grey80", lwd = 0, alpha=0.5)}+
+    {if(assess_id_temp_df$is_point[1]==F & grepl("plume", tolower(assess_id_temp_df$assess_id[1])))
+      geom_point(data=assess_id_temp_df, aes(x=mean_lon, y=mean_lat), fill="red", colour="grey80", alpha=0.5, size=3, shape=24)}+
+    {if(assess_id_temp_df$is_point[1]==T)geom_point(data=assess_id_temp_df, aes(x=mean_lon, y=mean_lat), fill="red", colour="grey80", alpha=0.5, size=3, shape=21)}+
+    coord_sf(xlim=c(lims[2], lims[3]), ylim=c(lims[4], lims[1]), expand=FALSE)+
+    theme_bw()+
+    theme(plot.title = element_text(hjust = 0.5),
+          axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+          axis.title.x = element_blank(),
+          axis.title.y = element_blank())
+  
+  map_id_list[[assess_id_temp]] <- gg_panel
+  }
+  return(map_id_list)
+}
+
+gg_polys <- highlight_poly(x=assess_id_list, shp=shp_part, base_map=coast, lims=c(north, west, east, south))
+```
+Combine the PI envelopes with the relevant time series as figures and save
+```{r, include=FALSE}
+#function to select, combine and save the combined plots
+combine_pi_plots <- function(x, y, z, limits, path){
+  
+  #generate directory for the plots
+  output_path_traj <- paste(path, "timeseries_", limits[1], "_to_", limits[2], "/", sep="")
+  dir.create(file.path(output_path_traj), showWarnings = FALSE)
+  
+  for(t in 1:length(x)){
+    data_id_temp <- names(x)[t]
+    
+    data_id_plot <- x[[data_id_temp]]
+    data_id_lf_plot <- y[[data_id_temp]]
+    
+    for(i in 1:length(data_id_plot)){
+      
+      lf1 <- unlist(strsplit(names(data_id_plot)[i], "-"))[1]
+      lf2 <- unlist(strsplit(names(data_id_plot)[i], "-"))[2]
+      
+      lf_pair_temp <- paste0(lf1,"-", lf2) 
+      lf_pair_plot <- data_id_plot[[lf_pair_temp]]
+  
+      lf1_plot <- data_id_lf_plot[[lf1]]
+      lf2_plot <- data_id_lf_plot[[lf2]]
+      
+      assess_ids <- intersect(names(lf1_plot), names(lf2_plot))
+      assess_ids <- intersect(assess_ids, names(lf_pair_plot))
+      
+      for(j in 1:length(assess_ids)){
+        
+        assess_id_temp <- assess_ids[j]
+        
+        #print an output to provide the user with a sense of progress
+        print(paste0("dataset: ", data_id_temp, ", ", "lifeform pair: ", paste0(lf1,"-", lf2), ", ", "assess_id: ", assess_id_temp))
+        
+        temp_plot <- grid.arrange(z[[assess_id_temp]], lf_pair_plot[[assess_id_temp]], grid.arrange(lf1_plot[[assess_id_temp]], lf2_plot[[assess_id_temp]]), 
+                               nrow = 1, 
+                               widths=c(1,1,2.5))
+        
+        #create the file path and directories
+        subdir_assess_id <- paste0(output_path_traj, paste0(assess_id_temp, "/"))
+        dir.create(file.path(subdir_assess_id), showWarnings = FALSE)
+        
+        #create the file path and directories
+        subdir_lf_pair <- paste0(subdir_assess_id, paste0(lf1,"-", lf2,"/"))
+        dir.create(file.path(subdir_lf_pair), showWarnings = FALSE)
+
+        #ensure the filename is not too long or it will fail
+        filename_temp <- paste(subdir_lf_pair, data_id_temp, ".png", sep="")
+        
+        ggsave(temp_plot, file=filename_temp,
+               height=15, width=50, units="cm", bg="white")
+      }
+    }
+  }
+}
+
+combine_pi_plots(x=env_plots, y=ts_plots, z=gg_polys, limits=c(start_query, end_query), path=output_path)
+```
+Create sf with multi-geometry (polygon and point)
+```{r}
+#create sf object for points
+assess_id_list <- df %>%
+    dplyr::select(data_id, assess_id, is_point)%>%
+    distinct() %>%
+    left_join(data.frame(data_id = df_datasets$data_id, 
+                         x = df_datasets$mean_lon,
+                         y = df_datasets$mean_lat), 
+                          by="data_id") %>%
+  arrange(is_point, data_id) %>%
+  filter(is_point) %>%
+  dplyr::select(assess_id, x, y) %>%
+  distinct() 
+
+pts <- st_as_sf(assess_id_list, coords = c("x","y"), remove = FALSE)
+st_crs(pts) <- 4326
+pts <- st_transform(pts, crs=st_crs(shp_part))
+pts <- pts %>% dplyr::select(assess_id, geometry) %>% dplyr::mutate(is_point=TRUE, is_plume=FALSE)
+
+shp_comb <- shp_part %>%
+  dplyr::mutate(is_point=FALSE,
+         is_plume=FALSE) %>%
+  dplyr::select(names(pts))
+
+```
+Create separate designation for river plumes
+```{r}
+plumes <- st_as_sf(plume_list, coords = c("mean_lon","mean_lat"), remove = FALSE)
+st_crs(plumes) <- 4326
+plumes <- st_transform(plumes, crs=st_crs(shp_part))
+plumes <- plumes %>% dplyr::select(assess_id, geometry) %>% dplyr::mutate(is_point=FALSE, is_plume=TRUE) %>% dplyr::select(names(pts))
+
+```
+Merge the model output dataframe values with the sf object
+```{r}
+#determine the datasets with the most months of real samples in an assessment unit
+df_unique_months <- df %>%
+  filter(n > 0) %>%
+  group_by(data_id, lifeform, assess_id) %>%
+  dplyr::summarise(prop_years = length(unique(year) %in% seq(min(year), max(year), 1)) / length(seq(min(year), max(year), 1)),
+            unique_months = n(),
+            .groups="drop") %>%
+  arrange(data_id, assess_id, lifeform) %>%
+  dplyr::select(data_id, assess_id, prop_years, unique_months) %>%
+  distinct()
+
+#summarise the PI results so there is a mean value if assessment area is covered by multiple datasets
+piSummary <- piResults %>%
+  left_join(df_unique_months, by=c("data_id", "assess_id"))
+
+piTemp <- piSummary %>%
+  filter(prop_years >= thr) %>%
+  group_by(assess_id, lf_pair) %>%
+  filter(unique_months == max(unique_months, na.rm=T)) %>%
+  ungroup()
+
+#merge geometry of points and polygons
+shp_comb <- rbind(shp_comb, pts, plumes)
+lf_shp <- expand.grid(lf_pair = unique(piTemp$lf_pair), assess_id = unique(shp_comb$assess_id))
+
+shp_merged <- merge(shp_comb, lf_shp, by="assess_id", all=T)
+shp_merged <- merge(shp_merged, piTemp, by=c("assess_id", "lf_pair"), all.x=TRUE)
+
+st_crs(shp_merged) <- 4326
+```
+Plot these PI results spatially across a map of Europe
+```{r}
+#create title reference string
+years_label <- paste0("Ref: " , refStart, "-", refStop, ",", " Comp: ", compStart, "-", compStop)
+years_label_simp <- janitor::make_clean_names(years_label)
+
+#arrange factor levels 
+shp_merged$lf_pair <- factor(shp_merged$lf_pair, levels=sort(unique(as.character(shp_merged$lf_pair))))
+
+#define colour palette
+source("Supporting_scripts/jet_palette.R")
+jetcols <- turbo_colormap_data_HEX
+
+#generate directory for the plots
+output_path_traj <- paste(output_path, "timeseries_", start_query, "_to_", end_query, "/", sep="")
+dir.create(file.path(output_path_traj), showWarnings = FALSE)
+
+#generate the plot output
+ggplot()+
+#ggtitle(paste0("Lifeform pairs indicator\n", years_label))+
+geom_sf(data=coast, inherit.aes=F, fill="grey80", colour="grey40", lwd = 0.2)+
+geom_sf(data=subset(shp_merged, is_point==F & is_plume==F), aes(fill=PI), colour="black", lwd = 0.2, alpha=0.9)+
+geom_sf(data=subset(shp_merged, is_point==F & is.na(PI) & is_plume==F), fill="white", colour="black", lwd = 0.2)+
+geom_sf(data=subset(shp_merged, is_point==T & !is.na(PI) & is_plume==F), aes(fill=PI), colour="black", alpha=0.9, shape=21, size=3)+
+geom_sf(data=subset(shp_merged, is_point==F & !is.na(PI) & is_plume==T), aes(fill=PI), colour="black", alpha=0.9, shape=24, size=3)+
+facet_rep_wrap(~lf_pair, repeat.tick.labels = TRUE, ncol=4)+
+coord_sf(xlim=c(west, east), ylim=c(south, north), expand=FALSE)+
+scale_fill_gradientn(name="PI", limits=c(1,0), trans = 'reverse', colours = jetcols)+
+theme_bw()+
+theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      strip.text.x = element_text(size = 9))
+ggsave(file=paste(output_path_traj, "pi_values_", years_label_simp, ".png", sep=""), 
+       height=20, width=30, units="cm", bg="white", dpi=500)
+
+```
+Merge the dataframe values with the sf object
+```{r}
+df_fits_tot_summary <- df_fits_tot %>%
+  inner_join(df_unique_months)
+
+#save an export of the Mann-Kendall results dataframe for linking to pressures/drivers of change in next step
+write_fst(df_fits_tot_summary, path=paste0(gsub(".fst", "", file_path), "_kendall", ".fst"))
+
+df_fits_tot_plot <- df_fits_tot_summary %>%
+  filter(prop_years >= thr) %>%
+  group_by(assess_id, lifeform) %>%
+  filter(unique_months == max(unique_months, na.rm=T)) %>%
+  ungroup()
+
+lf_shp <- expand.grid(lifeform = unique(df_fits_tot_plot$lifeform), assess_id = unique(shp_comb$assess_id))
+
+shp_merged <- merge(shp_comb, lf_shp, by="assess_id", all.x=TRUE, all.y=T)
+shp_merged <- merge(shp_merged, df_fits_tot_plot, by=c("assess_id", "lifeform"), all.x=TRUE)
+
+shp_merged$prop_years[is.na(shp_merged$prop_years)] <- 0
+```
+Plot the model outputs for Kendall statistic spatially for each lifeform
+```{r}
+shp_merged$lifeform <- factor(shp_merged$lifeform, levels=sort(unique(as.character(shp_merged$lifeform))))
+
+#set colour scale limits
+max_lim <- ceiling(max(abs(shp_merged$statistic), na.rm=T))
+lims <- c(-1*max_lim, max_lim)
+
+#switch off spherical geometry
+sf::sf_use_s2(FALSE)
+
+#generate the plot output
+ggplot()+
+geom_sf(data=coast, inherit.aes=F, fill="grey80", colour="grey40", lwd = 0.2)+
+geom_sf(data=subset(shp_merged, is_point == F & is_plume==F & !is.na(statistic)), aes(fill=statistic), colour="black", lwd = 0.2, alpha=0.9)+
+geom_sf_pattern(data=nngeo::st_remove_holes(subset(shp_merged,is_point == F & is_plume==F & sig==TRUE)),
+                aes(pattern = sig, fill=statistic),
+                pattern="stripe", 
+                pattern_size=0,
+                pattern_density=0.05,
+                pattern_colour=NA,
+                pattern_fill="black",
+                pattern_fill2=NA,
+                lwd=0)+
+geom_sf(data=subset(shp_merged, is_point == F & is_plume == F & is.na(statistic)), fill="white", colour="black", lwd = 0.2)+
+geom_sf(data=subset(shp_merged, is_point==F & is_plume == T & !is.na(statistic)), aes(fill=statistic), colour="black", alpha=0.9, shape=24, size=3)+
+geom_sf(data=subset(shp_merged, is_point==F & is_plume == T & !is.na(statistic) & sig == T), colour="black", alpha=0.9, shape=17, size=1)+
+geom_sf(data=subset(shp_merged, is_point==T & is_plume == F & !is.na(statistic)), aes(fill=statistic), colour="black", alpha=0.9, shape=21, size=3)+
+geom_sf(data=subset(shp_merged, is_point==T & is_plume == F & !is.na(statistic) & sig == T), colour="black", alpha=0.9, size=1)+
+facet_rep_wrap(~lifeform, repeat.tick.labels = TRUE, ncol=4)+
+coord_sf(xlim=c(west, east), ylim=c(south, north), expand=FALSE)+
+scale_fill_gradientn(colours = c("#5e3c99","#ffffbf","#e66101"), limits=lims, 
+                     values = scales::rescale(seq(lims[1],lims[2],(lims[2]-lims[1])/4)),
+                     name="Kendall\nstatistic")+  
+theme_bw()+
+theme(plot.title = element_text(hjust = 0.5),
+      axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+      axis.title.x = element_blank(),
+      axis.title.y = element_blank(),
+      strip.text.x = element_text(size = 9))
+ggsave(file=paste(output_path_traj, "Kendall_", min(df$year), "_to_", max(df$year), ".png", sep=""), 
+       height=40, width=30, units="cm", bg="white", dpi=500)
+```
+Read the raw data and perform Mann-Kendall on each taxa. Group taxa by Kendall stat.
+```{r, include=FALSE}
+km_clust_lf <- function(x, lims, threshold){
+  
+  data_ids <- sort(unique(x$data_id))
+  list_data_id_final <- list()
+  for(t in 1:length(data_ids)){
+  
+  data_id_temp <- data_ids[t]
+  
+  x_data_id <- x %>% 
+    filter(data_id == all_of(data_id_temp) &
+                          year >= lims[1] &
+                          year <= lims[2])
+  
+  #isolate relevant lifeforms
+  id_vars <- c("lon", "lat", "assess_id", "data_id", "contracting_party", "dataset_name", "year", "month", "day", "hour", "minute", "count", "taxon", "aphia_id")
+
+  lifeforms_all <- sort(colnames(x_data_id)[!(colnames(x_data_id) %in% id_vars)])
+  lifeforms <- colnames(x_data_id[lifeforms_all][colSums(x_data_id[lifeforms_all][lifeforms_all]) > 0])
+
+  df_n <- x_data_id %>%
+            dplyr::select(assess_id, year, month, day, hour, minute) %>%
+            distinct() %>%
+            group_by(assess_id, year) %>%
+            dplyr::summarise(n_year = n()) %>%
+            ungroup() %>%
+            group_by(assess_id) %>%
+            dplyr::mutate(n_total = sum(n_year)) %>%
+            ungroup()
+  
+  list_output_km <- list()
+  list_output_ts <- list()
+  for(i in 1:length(lifeforms)){
+    
+      df_taxa <- x_data_id %>%
+          dplyr::filter(get(lifeforms[i])==1) %>%
+          dplyr::select(aphia_id, taxon) %>%
+          dplyr::mutate(aphia_id = as.character(aphia_id)) %>%
+          distinct()
+      
+      ids <- sort(unique(x_data_id$assess_id))
+      
+      clust_lf <- list()
+      clust_ts <- list()
+      for(j in 1:length(ids)){
+        
+        print(paste0("dataset: ", data_id_temp, ", ", "lifeform: ", lifeforms[i], ", ", "assess_id: ", ids[j]))
+        
+        df_samples <- x_data_id %>%
+          filter(assess_id == all_of(ids[j])) %>%
+          dplyr::select(lon, lat, year, month, day, hour, minute) %>%
+          distinct()
+        
+        df_clust_ini <- x_data_id %>%
+          dplyr::filter(get(lifeforms[i])==1 &
+                          assess_id==all_of(ids[j]))
+        
+        year <- sort(unique(df_samples$year))
+        
+        if(length(year) > 3){
+           prop_years <- length(year %in% seq(min(year), max(year), 1)) / length(seq(min(year), max(year), 1))
+        } else {
+          prop_years <- 0
+        }
+        
+        if(nrow(df_clust_ini) > 0 &
+        prop_years >= threshold){  
+        
+          df_clust_lf_mon <- df_clust_ini %>%
+              dplyr::group_by(lon, lat, year, month, day, hour, minute, taxon) %>%
+              dplyr::summarise(count=sum(count, na.rm=T),
+                               .groups = 'drop') %>%
+              pivot_wider(names_from = taxon, 
+                  values_from = count,
+                  values_fill = 0)
+          
+          #work on proper inclusion of 0 values for samples that did not detect these taxa
+          taxa <- names(df_clust_lf_mon)[!names(df_clust_lf_mon) %in% names(df_samples)] 
+          
+          df_fill <- df_samples %>%
+            anti_join(df_clust_lf_mon)
+          
+          extra_samples <- data.frame(matrix(0, ncol = length(taxa), nrow = nrow(df_fill)))
+          names(extra_samples) <- taxa
+          extra_samples <- cbind(df_fill, extra_samples)
+          
+          df_clust_lf_mon <- df_clust_lf_mon %>%
+            bind_rows(extra_samples) %>%
+            pivot_longer(-c("year", "month", "day", "hour", "minute", "lat", "lon"), names_to = "taxon", values_to = 'count') %>%
+            dplyr::group_by(year, month, taxon) %>%
+            dplyr::summarise(count_mon = mean(count, na.rm=T),
+                             .groups = 'drop') %>%
+            arrange(taxon, year, month) %>%
+            group_by(taxon) %>% #add 0.5*min_non_zero to 0 counts
+            dplyr::mutate(min_non_zero = min( count_mon[count_mon!=min(count_mon)] )) %>%
+            dplyr::mutate(count_mon = count_mon + min_non_zero*0.5) %>%
+            ungroup() %>%
+            dplyr::select(-min_non_zero)
+              
+          df_clust_lf <- df_clust_lf_mon %>%
+              group_by(year, taxon) %>%
+              dplyr::summarise(count = mean(count_mon, na.rm=T),
+                               .groups = 'drop') %>%
+            inner_join(df_clust_lf_mon, by=c("year", "taxon"))
+          
+          df_kendall <- df_clust_lf %>%
+              dplyr::select(year, taxon, count) %>%
+              distinct() %>%
+              arrange(taxon, year) %>%
+              dplyr::group_by(taxon) %>%
+              dplyr::mutate(year = as.integer(year),
+                     count = log10(count)) %>%
+              do(tidy(suppressWarnings(kendallTrendTest(count ~ year, ci.slope=FALSE, data=.))))
+          
+              kendall_results <- data.frame(taxon=df_kendall$taxon, 
+                                            statistic=df_kendall$statistic,
+                                            p.value=df_kendall$p.value)
+              rownames(kendall_results) <- kendall_results$taxon
+              kendall_results <- subset(kendall_results, !is.na(kendall_results$statistic))
+              
+              kendall_results$clust <- ifelse(kendall_results$statistic < 0 & kendall_results$p.value <= 0.05, 1,
+                                              ifelse(kendall_results$statistic > 0 & kendall_results$p.value <= 0.05, 3,
+                                                     2))
+
+              km.df <- data.frame(clust=kendall_results$clust, 
+                                  taxon=kendall_results$taxon,
+                                  statistic=kendall_results$statistic,
+                                  p.value=kendall_results$p.value) %>%
+                                  left_join(df_taxa, by="taxon") %>%
+                                  group_by(clust) %>%
+                                  dplyr::mutate(mean_statistic=mean(statistic)) %>%
+                ungroup()
+      
+                #also create an aggregated dataframe for the values
+                clusters <- data.frame(clust=kendall_results$clust)
+
+                df_clust_ts <- df_clust_lf %>%
+                    left_join(km.df, by="taxon") %>%
+                    filter(!is.na(clust))
+              
+          }else{
+          
+          df_clust_ts <- data.frame(year=NA, taxon=NA, count=NA, month=NA, count_mon=NA, clust=NA, statistic=NA,
+                                    p.value=NA, aphia_id=NA, mean_statistic=NA)
+          
+        }
+        
+        df_clust_ts$assess_id <- ids[j]
+        
+        df_clust_ts <- df_clust_ts %>%
+                    left_join(df_n, by=c("assess_id","year"))
+              
+        clust_ts[[j]] <- df_clust_ts
+        
+      }
+      
+      ts_output <- do.call(rbind, clust_ts)
+      ts_output$lifeform <- lifeforms[i]
+      
+      list_output_ts[[i]] <- ts_output
+  }
+
+  final_output_ts <- do.call(rbind, list_output_ts)
+  final_output_ts$data_id <- data_id_temp
+  
+  list_data_id_final[[t]] <- final_output_ts
+
+  }
+  out <- do.call(rbind, list_data_id_final)
+  return(out)
+}
+```
+Check if the process of isolating the data for the taxa time-series has already been completed. If not, run the function and save the result so this doesn't have to be repeated
+```{r, include=FALSE}
+file_taxa_ts <- paste0(gsub(".fst", "", file_path), "_km", "_ts", "_", start_query, "_to_", end_query, ".fst")
+
+if(!file.exists(file_taxa_ts)){
+  
+  #generate a string for the directory of the relevant CSV file
+  file_path_raw <- paste(dir_shp, gsub(".shp", "", file_shp_part), "_abund_raw", ".fst", sep="")
+  
+  #read in the data
+  df_raw <- read_fst(path=file_path_raw)
+
+  #run the function
+  df_clust_ts <- km_clust_lf(x=df_raw,lims=c(start_query, end_query), threshold=thr)
+  
+  rm(df_raw)
+  
+  write_fst(df_clust_ts, path=paste0(gsub(".fst", "", file_path), "_km", "_ts", "_", start_query, "_to_", end_query, ".fst"))
+
+}else{
+  
+  df_clust_ts <- as.data.frame(read_fst(path=file_taxa_ts))
+  
+}
+```
+Plot the time series for each taxa within a lifeform in a spatial unit
+```{r}
+#function to plot the time series for the individual taxa
+plot_taxa_ts <- function(x){
+  
+  #create labeller lookup table
+  df_lookup_main <- data.frame(data_id = x$data_id, assess_id = x$assess_id, lifeform=x$lifeform, taxon = x$taxon,
+                                   string=paste0(x$taxon, ' ', x$aphia_id, '\n', 
+                    'z: ', round(x$statistic, 2), ' ',
+                    'p: ', ifelse(x$p.value <= 0.05, "<=0.05", round(x$p.value,3)))) %>% 
+                    distinct()
+  
+  #remove NA values
+  x <- x[complete.cases(x), ]
+    
+  full_plot_list <- list()
+  for(t in 1:length(unique(x$data_id))){
+    
+    data_id_temp <- sort(unique(x$data_id))[t]
+    
+    x_data_id <- subset(x, data_id == data_id_temp)
+    lookup_data_id <- subset(df_lookup_main, data_id == data_id_temp)
+    
+    lifeforms <- sort(unique(x_data_id$lifeform))
+    
+    years <- as.integer(c(min(x_data_id$year), max(x_data_id$year)))
+               
+               
+    years_brk <- ifelse(plyr::round_any(years[2],5,f=ceiling)-plyr::round_any(years[1],5,f=floor) <= 20, "2 years", "5 years")
+  
+    years <- seq.Date(from = as.Date(paste(plyr::round_any(years[1],5,f=floor),"01","01",sep="-")), 
+                  to = as.Date(paste(plyr::round_any(years[2],5,f=ceiling)+1,"01","01",sep="-")), 
+                  by = years_brk)
+        
+    #encode years as a date variable
+    x_data_id$year <- as.Date(paste(x_data_id$year, "07", "02"), "%Y %m %d")
+        
+    #encode PC as a factor
+    x_data_id$clust <- as.factor(x_data_id$clust)
+    x_data_id$taxon <- as.factor(x_data_id$taxon)
+    
+    plot_list <- list()
+    for(i in 1:length(lifeforms)){
+        
+        lifeform_temp <- lifeforms[i]
+    
+        df_lookup_lf <- lookup_data_id %>%
+          filter(lifeform==lifeform_temp)
+        
+        ts_temp_lf <- x_data_id %>%
+          filter(lifeform==lifeform_temp)
+        
+        ids <- sort(unique(ts_temp_lf$assess_id))
+        
+        sub_plot_list <- list()
+        for(j in 1:length(ids)){
+          
+          id_temp <- as.character(ids[j])
+          
+          df_lookup_lf_id <- df_lookup_lf %>%
+            filter(assess_id==id_temp)
+          df_lookup_lf_id <- setNames(df_lookup_lf_id$string, df_lookup_lf_id$taxon)
+    
+          ts_temp_lf_id <- ts_temp_lf %>%
+            filter(assess_id==id_temp)
+          
+          ts_temp_lf_id$taxon <- fct_reorder(ts_temp_lf_id$taxon, ts_temp_lf_id$statistic, .desc = FALSE)
+          
+          ts_temp_lf_id$log_count <- log10(ts_temp_lf_id$count)
+          
+          gg_panel <- ggplot()+
+          geom_smooth(data=ts_temp_lf_id, aes(x=year, y=log_count), formula= y ~ x,
+                      linetype="dashed",
+                      colour="black",
+                      method = 'lm', se = FALSE, show.legend = FALSE) +
+          geom_path(data=ts_temp_lf_id,aes(x=year, y=log_count, colour=clust), show.legend = FALSE)+
+          geom_point(data=ts_temp_lf_id,aes(x=year, y=log_count, fill=clust), shape=21, show.legend = FALSE)+
+          #ggtitle(paste(ids[j], lifeforms[i], "n =", ts_temp_lf_id$n_total[1]))+
+          facet_wrap(~taxon, ncol=5, labeller=labeller(taxon=df_lookup_lf_id))+
+          scale_x_date(breaks = years, date_labels = "%Y",
+                       minor_breaks = NULL)+
+          scale_y_continuous(name=bquote(log[10]* "(" * .(lifeforms[i]) * ")"), minor_breaks = NULL)+
+          scale_fill_manual(values=c("1"="#F8766D", "2"="#619CFF", "3"="#5FD382"))+
+          scale_colour_manual(values=c("1"="#F8766D", "2"="#619CFF", "3"="#5FD382"))+
+          theme_bw()+
+          theme(plot.title = element_text(hjust = 0.5),
+                  axis.text.x = element_text(angle = 45, hjust=1, vjust=1),
+                  axis.title.x = element_blank())
+          #ggsave(filename="test.png", height=50, width=30, units="cm")
+          
+          sub_plot_list[[id_temp]] <- gg_panel
+        }
+        plot_list[[lifeform_temp]] <- sub_plot_list
+    }
+    full_plot_list[[data_id_temp]] <- plot_list
+  }
+  return(full_plot_list)
+}
+
+taxa_ts_plots <- plot_taxa_ts(x=df_clust_ts)
+```
+Finally, combine the lifeform time-series with the relevant taxa timeseries
+```{r, include=FALSE}
+#function to select, combine and save the combined plots
+combine_ts_plots <- function(x, y, z, raw, limits, path){
+  
+  #check intersection of datasets for raw and lifeform data
+  data_ids <- intersect(names(x), names(y))
+  
+  #generate directory for the plots
+  output_path_traj <- paste(path, "timeseries_", limits[1], "_to_", limits[2], "/", sep="")
+  dir.create(file.path(output_path_traj), showWarnings = FALSE)
+  
+  for(t in 1:length(data_ids)){
+    data_id_temp <- data_ids[t]
+    
+    data_id_plot <- x[[data_id_temp]]
+    data_id_lf_plot <- y[[data_id_temp]]
+    
+    lifeforms <- intersect(names(data_id_plot),names(data_id_lf_plot))
+    
+    for(i in 1:length(lifeforms)){
+      
+      lifeform_temp <- lifeforms[i]
+      
+      lf_ts_plot <- data_id_plot[[lifeform_temp]]
+      lf_taxa_plot <- data_id_lf_plot[[lifeform_temp]]
+  
+      assess_ids <- intersect(names(lf_ts_plot),names(lf_taxa_plot))
+      
+      if(length(assess_ids) > 0){
+        
+        for(j in 1:length(assess_ids)){
+          
+          #ensure subplots are available in all lists
+          assess_id_temp <- assess_ids[j]
+          
+          ts_plot_temp <- lf_ts_plot[[assess_id_temp]]
+          
+          #determine the number of facets in the plot for determining plot size
+          n_facets <- length(unique(lf_taxa_plot[[assess_id_temp]]$layers[[1]]$data$taxon))
+          
+          #work out size ratios
+          lf_ts_h <- 8
+          taxa_ts_h <- 3
+          
+          #work out the height for the second plot
+          full_rows <- n_facets %/% 5
+          rmndr <- n_facets %% 5
+          n_rows <- ifelse(rmndr > 0, full_rows+1, full_rows)
+    
+          temp_plot <- suppressWarnings(plot_grid(plot_grid(z[[assess_id_temp]], ts_plot_temp, 
+                                                            nrow=1, rel_widths=c(1,3.5),
+                                                            align="v"), 
+                                    lf_taxa_plot[[assess_id_temp]],
+                                    nrow = 2, align="h", axis="lr",
+                                    rel_heights=c(lf_ts_h, taxa_ts_h*n_rows)))
+                
+          #print an output to provide the user with a sense of progress
+          print(paste0("dataset: ", data_id_temp, ", ", "lifeform: ", lifeform_temp, ", ", "assess_id: ", assess_id_temp))
+          
+          #create the file path and directories
+          subdir_assess_id <- paste0(output_path_traj, paste0(assess_id_temp, "/"))
+          dir.create(file.path(subdir_assess_id), showWarnings = FALSE)
+        
+          #create the file path and directories
+          subdir_lifeform <- paste0(subdir_assess_id, paste0(lifeform_temp,"/"))
+          dir.create(file.path(subdir_lifeform), showWarnings = FALSE)
+
+          #ensure the filename is not too long
+          filename_temp <- paste(subdir_lifeform, data_id_temp, ".png", sep="")
+          
+          ggsave(temp_plot, file=filename_temp,
+                 height=lf_ts_h+taxa_ts_h*n_rows, width=30, units="cm", bg="white", limitsize = FALSE)
+        }
+      }
+    }
+  }
+}
+
+combine_ts_plots(x=ts_plots, y=taxa_ts_plots, z=gg_polys, raw=df_clust_ts, limits=c(start_query, end_query), path=output_path)
+```
+
+
+
+
+
+
+
+
+
+
+
+

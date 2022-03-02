@@ -1,0 +1,556 @@
+---
+title: "Processed CPR loader tool"
+---
+
+This tool reads processed aggregated and disaggregated plankton lifeform abundance data before interpolating over the polygons of a shapefile. It then calculates mean values for spatial polygons of a shapefile per lifeform, year and month and uses the interpolated data to fill gaps in the time-series. It then saves the output data to disk.
+
+Author: Matthew Holland
+Contact: matt.holland@plymouth.ac.uk
+Latest version date: 1 March 2022
+```{r}
+#clear R environment
+rm(list = ls()) 
+
+options(scipen=999)
+
+#enter a rough bounding box for visualisation only (in decimal degrees format)
+north <- 64
+west <- -16
+east <- 14
+south <- 34
+
+#enter the file directory path for the shapefile to partition the data
+path_shp_part <- "../Data_raw/COMP4_assessment_areas_v7e/"
+
+#enter the filename of the shapefile to partition the data
+file_shp_part <- "COMP4_assessment_areas_v7e.shp"
+
+#provide the name of the variable in the shapefile used for separating the assessment areas
+assess_des <- "LongName"
+
+#enter the main directory to use to access the processed data
+dir_main <- "../Data_processed/"
+
+#enter the directory where raw data is stored
+dir_raw <- "../Data_raw/"
+```
+Load required packages and install if not already installed
+```{r, include=FALSE}
+#check if all required packages are installed. Install them if they are not present. 
+#Then load required packages
+
+#install rnaturalearthhires for map data
+devtools::install_github("ropensci/rnaturalearthhires")
+
+list.of.packages <- c("raster", "sf", "ggplot2", "tidyverse", "rnaturalearth", "viridis", "data.table", "gstat", "exactextractr", "fst")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages)
+lapply(list.of.packages, require, character.only = TRUE)
+rm(list.of.packages)
+
+options(scipen=999)
+
+#switch off spherical geometry
+sf::sf_use_s2(FALSE)
+```
+Load the desired shapefiles
+```{r}
+#load the shapefile of interest for partitioning the data
+shp_part <- st_read(paste(path_shp_part, file_shp_part, sep=""))
+
+#choose the variable to use as the primary separator of assessment areas
+shp_part$assess_id <- shp_part[[assess_des]]
+
+#load shapefile of European landmass to use to subset the grid to avoid requesting data over landmasses
+coast <- rnaturalearth::ne_countries(returnclass = "sf", scale = "large")
+
+#display shapefile on European continent
+ggplot()+
+  geom_sf(data=shp_part, fill="lightblue", colour="red")+
+  geom_sf(data=coast, fill="darkseagreen1")+
+  coord_sf(xlim=c(west, east), ylim=c(south, north))+
+  theme_bw()
+```
+Load the aggregated data and set it up for IDW interpolation
+```{r}
+df_abund_agg <- read_fst(path=paste0(dir_main, "Plankton_processed/", "plankton_by_lifeform.fst"))
+
+#exclude data where abundance is na
+df_abund_agg <- subset(df_abund_agg, !is.na(count))
+
+#create year-month variable
+df_abund_agg$month <- ifelse(nchar(df_abund_agg$month)==1, paste0( 0,df_abund_agg$month),df_abund_agg$month)
+df_abund_agg$yearmon <- paste(df_abund_agg$year, df_abund_agg$month, sep=",")
+```
+Detect whether datasets are point or distributed and label them accordingly
+```{r}
+#seperate the data based on the standard deviation of the coordinates
+df_abund_agg <- df_abund_agg %>%
+  group_by(data_id) %>%
+  dplyr::mutate(mean_lat=mean(lat),
+         mean_lon=mean(lon),
+         sd_lat=sd(lat),
+            sd_lon=sd(lon)) %>%
+  ungroup() %>%
+  dplyr::mutate(is_point = ifelse(sd_lat <= 0.0001 & sd_lat <= 0.0001, TRUE, FALSE)) %>%
+  dplyr::select(-sd_lon, -sd_lat)
+
+#load the datasets index
+df_datasets <- fread(file=paste0(dir_main, "dataset_ids", ".csv"))
+
+#tag the datasets by whether they are point or distributed
+df_datasets$is_point <- df_abund_agg$is_point[match(df_datasets$data_id, df_abund_agg$data_id)]
+df_datasets$mean_lat <- df_abund_agg$mean_lat[match(df_datasets$data_id, df_abund_agg$data_id)]
+df_datasets$mean_lon <- df_abund_agg$mean_lon[match(df_datasets$data_id, df_abund_agg$data_id)]
+
+df_datasets$mean_lat[df_datasets$is_point == FALSE] <- NA
+df_datasets$mean_lon[df_datasets$is_point == FALSE] <- NA
+
+#add additional points for point stations data
+df_datasets$assess_id <- df_datasets$dataset_name  
+  
+df_datasets[grepl(tolower("NLWKN"), tolower(df_datasets$assess_id)), "assess_id"] <- "Norderney"
+df_datasets[grepl(tolower("PML"), tolower(df_datasets$assess_id)), "assess_id"] <- "L4"
+df_datasets[grepl(tolower("Scalloway"), tolower(df_datasets$assess_id)), "assess_id"] <- "Scalloway"
+df_datasets[grepl(tolower("Loch Ewe"), tolower(df_datasets$assess_id)), "assess_id"] <- "Loch Ewe"
+df_datasets[grepl(tolower("Scapa"), tolower(df_datasets$assess_id)), "assess_id"] <- "Scapa"
+df_datasets[grepl(tolower("Stonehaven"), tolower(df_datasets$assess_id)), "assess_id"] <- "Stonehaven"
+df_datasets[grepl(tolower("Newcastle"), tolower(df_datasets$assess_id)), "assess_id"] <- "Newcastle"
+df_datasets[grepl(tolower("Dove"), tolower(df_datasets$assess_id)), "assess_id"] <- "Newcastle"
+df_datasets[grepl(tolower("Gabbard"), tolower(df_datasets$assess_id)), "assess_id"] <- "West Gabbard"
+df_datasets[grepl(tolower("SAMS"), tolower(df_datasets$assess_id)), "assess_id"] <- "LPO"
+
+df_datasets$assess_id[!df_datasets$is_point] <- NA
+
+#save the datasets info dataframe
+fwrite(df_datasets, file=paste0(dir_main, "dataset_ids_and_point_id", ".csv"))
+
+#isolate the point data
+df_abund_agg_point <- df_abund_agg %>%
+            filter(is_point)
+
+#isolate the distributed data
+df_abund_agg_dist <- df_abund_agg %>%
+            filter(!is_point)
+
+rm(df_abund_agg)
+```
+Preparing the spatial data for interpolation
+```{r}
+#convert shapefile to spatial to subtract landmass
+shp_sp <- as_Spatial(st_zm(shp_part))
+coast_sp <- as_Spatial(st_zm(coast))
+coast_sp <- spTransform(coast_sp, crs(shp_sp))
+
+#make data spatial and reduce to one entry per coordinate set to improve efficiency
+df_abund_sp <- df_abund_agg_dist %>%
+  dplyr::select(lon, lat) %>%
+  distinct() %>%
+  dplyr::mutate(coord_id = rownames(.))
+
+#tag the full dataset with coordinate IDs
+df_abund_agg_dist$coord_id <- df_abund_sp$coord_id[match(paste(df_abund_agg_dist$lon,df_abund_agg_dist$lat),
+                                                         paste(df_abund_sp$lon,df_abund_sp$lat))]
+
+#make the subset dataset spatial
+coordinates(df_abund_sp) <- ~ lon + lat
+proj4string(df_abund_sp) <- crs(shp_part)
+
+#identify the points over land
+land_pts <- over(df_abund_sp, coast_sp)
+land_pts <- subset(land_pts, !is.na(featurecla))  
+
+#subset the original points to exclude points over land
+df_abund_agg_dist <- df_abund_agg_dist %>%
+  filter(!coord_id %in% row.names(land_pts))
+
+#make abundance data spatial and transform to log
+df_abund_sp <- df_abund_agg_dist %>%
+    dplyr::mutate(count=log10(count))
+
+coordinates(df_abund_sp) <- ~ lon + lat
+proj4string(df_abund_sp) <- crs(shp_part)
+
+#Create an empty grid where n is the total number of cells
+ext <- extent(west-2, east, south, north+2)
+p <- as(ext, 'SpatialPolygons') 
+proj4string(p) <- crs(shp_sp)
+grd <- as.data.frame(makegrid(p, cellsize = 0.5, pretty = TRUE))
+names(grd)       <- c("lon", "lat")
+grd <- subset(grd, !(grd$lon > 0 & grd$lon < 18 & grd$lat > 30 & grd$lat < 47)) #remove the Mediterranean
+coordinates(grd) <- c("lon", "lat")
+proj4string(grd) <- crs(shp_sp)
+grd <- rgeos::gDifference(grd, coast_sp)
+
+grd_rast <- as.data.frame(grd)[, c("x", "y")]
+grd_rast$z <- 1
+grd_rast <- rasterFromXYZ(as.data.frame(grd_rast)[, c("x", "y", "z")])
+grd_rast[is.na(grd_rast)] <- 0
+
+dialate_rast <- focal(grd_rast, w=matrix(1, 3, 3), function(x) max(x))
+dialate_rast[dialate_rast==0] <- NA
+
+grd <- SpatialPoints(rasterToPoints(dialate_rast)[,1:2])
+proj4string(grd) <- crs(shp_sp)
+gridded(grd) <- TRUE  # Create SpatialPixel object
+
+rm(p, ext, coast_sp, land_pts, grd_rast, dialate_rast)
+
+plot(grd)
+```
+Run the IDW interpolation loop (Note: This step takes hours!)
+```{r, include=FALSE}
+for(t in 1:length(unique(df_abund_sp$data_id))){
+
+  data_id_temp <- sort(unique(df_abund_sp$data_id))[t]
+  dataset_temp <- subset(df_abund_sp, data_id == data_id_temp)
+
+  for(lf in sort(unique(dataset_temp$lifeform))){
+  
+    #subset to lifeform of interest
+    abund_sp_lifeform <- subset(dataset_temp, lifeform == lf)
+    
+    df_lifeform_rmse <- data.frame()
+    r_lifeform_interp <- raster::stack()
+    
+    for(mon in sort(unique(abund_sp_lifeform$yearmon))){
+      
+      #subset CPR Data by year-month
+      abund_sp_month <- subset(abund_sp_lifeform, yearmon == mon)
+      
+      #due to the nature of CPR data, more points are required for the interpolation
+      idw_min <- ifelse(grepl(tolower("mba"), tolower(data_id_temp)), 5, 1)
+      
+      #interpolate the grid cells using a power value of 2 (idp=2.0)
+      P.idw <- gstat::idw(count ~ 1, abund_sp_month, newdata=grd, 
+                          idp=2.0, nmin=idw_min, nmax=15, maxdist=463, debug.level = 0)
+      
+      #convert to raster object then clip to shapefile
+      r <- raster(P.idw)
+      #r <- mask(r, shp_sp)
+      names(r) <- paste(lf,mon,sep=".")
+      #plot(r, main=names(r))
+      print(paste(data_id_temp,lf,mon,sep="/"))
+      
+      #can't calculate RMSE if there is only one value being interpolated
+      if(nrow(abund_sp_month)>=2){
+      
+        #leave-one-out validation routine
+        IDW.out <- vector(length = length(abund_sp_month))
+        for (i in 1:length(abund_sp_month)) {
+          IDW.out[i] <- idw(count ~ 1, abund_sp_month[-i,], abund_sp_month[i,], idp=2.0, debug.level = 0)$var1.pred
+        }
+        
+        #compute RMSE
+        rmse <- sqrt(sum((IDW.out - abund_sp_month$count)^2) / length(abund_sp_month))
+        
+      }else{
+        
+        rmse <- NA
+        
+      }
+      
+      rmse_temp <- data.frame(name=paste(lf,mon,sep="."), rmse=rmse, n=nrow(abund_sp_month))
+      df_lifeform_rmse <- rbind(df_lifeform_rmse, rmse_temp)
+      r_lifeform_interp <- stack(r_lifeform_interp, r)
+      
+    }
+    
+    dir_idw <- paste0(dir_main, "IDW_raster_stacks", "/")
+    dir.create(file.path(dir_idw), showWarnings = FALSE)
+    
+    dir_rast <- paste0(dir_idw, sort(unique(df_abund_sp$data_id))[t], "/")
+    dir.create(file.path(dir_rast), showWarnings = FALSE)
+    
+    fwrite(df_lifeform_rmse, file=paste0(dir_rast, lf, ".csv"))
+    writeRaster(r_lifeform_interp, filename=paste0(dir_rast, lf, ".grd"), format="raster", overwrite=T)
+    
+  }
+}
+```
+Load the raster stacks created in the last code chunk
+```{r, include=FALSE}
+#generate a string of filenames for the relevant raster files
+file_list <- list.files(paste0(dir_main, "IDW_raster_stacks", "/"), recursive = TRUE)
+
+#remove the file type from string
+file_list <- unique(gsub("\\..*","",file_list))
+
+#determine the number of unique datasets
+dsets <- sort(unique(file_list))
+
+#split the file list vector
+df_files <- data.frame(data_id=sub('/.*', '', dsets),
+           lifeform=sub('.*\\/', '', dsets))
+
+#load the raster stacks and combine them into a single list of megastacks per dataset
+stack_list <- list()
+for(j in 1:length(unique(df_files$data_id))){
+  
+  data_id_temp <- sort(unique(df_files$data_id))[j]
+  file_list_sub <- subset(df_files, grepl(data_id_temp, df_files$data_id))
+  
+  r_list <- list()
+  for(i in 1:nrow(file_list_sub)){
+    
+    file <- paste(file_list_sub$data_id[i], file_list_sub$lifeform[i], sep="/")
+    
+    print(file)
+    
+    #load the raster stack
+    temp_stack <- stack(paste0(dir_main, "IDW_raster_stacks", "/", file, ".grd"))
+    
+    #append the name of the raster stack to the dataset id
+    #names(temp_stack) <- paste(data_id_temp, names(temp_stack), sep=".")
+    
+    extent(temp_stack) <- extent(shp_part)
+    r_list[[i]] <- temp_stack
+    
+  }
+  r_stack <- stack(r_list)
+  stack_list[[data_id_temp]] <- r_stack
+}
+
+rm(temp_stack, r_list)
+```
+Perform a spatial extraction on the raw data as well
+```{r}
+df_abund_raw <- read_fst(path=paste0(dir_main, "Plankton_processed/", "plankton_by_taxon.fst"))
+
+```
+Label the raw data by intersection with polygons 
+```{r}
+pnts_stns <- df_datasets %>%
+  filter(is_point) %>%
+  dplyr::select(mean_lon, mean_lat, assess_id) %>%
+  dplyr::rename(lon=mean_lon,
+         lat=mean_lat) %>%
+  distinct()
+
+#reduce to unique coordinate sets
+pnts <- df_abund_raw %>%
+  anti_join(data.frame(lon=pnts_stns$lon,
+                       lat=pnts_stns$lat)) %>%
+  dplyr::select(lon, lat) %>%
+  distinct()
+
+# create a points collection
+pnts_sf <- do.call("st_sfc",c(lapply(1:nrow(pnts), 
+function(i) {st_point(as.numeric(pnts[i, ]))}), list("crs" = 4326))) 
+
+pnts_trans <- st_transform(pnts_sf, 2163) # apply transformation to pnts sf
+tt1_trans <- st_transform(shp_part, 2163) # apply transformation to polygons sf
+
+# intersect and extract region ID name
+pnts$assess_id <- apply(st_intersects(tt1_trans, pnts_trans, sparse = FALSE), 2, 
+               function(col) { 
+                  tt1_trans[which(col), ]$assess_id
+               })
+
+pnts <- subset(pnts, assess_id != "character(0)")
+pnts$assess_id <- as.factor(unlist(pnts$assess_id))
+
+pnts <- rbind(pnts, pnts_stns) %>%
+  distinct()
+
+#merge with the raw data
+df_abund_raw <- merge(as.data.table(pnts), as.data.table(df_abund_raw), by=c("lon", "lat"), all.x=TRUE)
+
+#save the data as fst
+dir_shp <- paste0(dir_main, gsub(".shp","",file_shp_part), "/")
+dir.create(file.path(dir_shp), showWarnings = FALSE)
+
+write_fst(df_abund_raw, path=paste(dir_shp, gsub(".shp", "", file_shp_part), "_abund_raw", ".fst", sep=""))
+```
+Partition the raster stack by polygon within a shapefile and calculate a mean value over the polygon 
+```{r}
+df_list <- list()
+for(i in 1:length(stack_list)){
+  
+  temp_stack <- stack_list[[names(stack_list)[i]]]
+  
+  print(names(stack_list)[i])
+  
+  #extract raster stack by polygon
+  df_count_mean <- exact_extract(temp_stack, shp_part, fun="mean")
+  df_count_mean <- cbind(assess_id = shp_part$assess_id, df_count_mean)
+  df_count_mean <- as.data.table(df_count_mean)
+  
+  #melting the data in records
+  id_vars <- "assess_id"
+  measure_vars <- colnames(df_count_mean)[!(colnames(df_count_mean) %in% id_vars)]
+  df_count_mean <- data.table::melt(df_count_mean, id.vars = id_vars,
+                             measure.vars = measure_vars,
+                             value.name = "count")
+  df_count_mean$data_id <- names(stack_list)[i]
+  
+  df_list[[names(stack_list)[i]]] <- df_count_mean
+}
+df_count_mean <- do.call(rbind, df_list)
+rm(df_list)
+```
+Clean up the data table
+```{r}
+#exclude NaN rows
+df_count_mean <- subset(df_count_mean, !is.na(count))
+
+#split the character string from the raster stack names
+df_count_mean$variable <- as.character(df_count_mean$variable)
+df_count_mean[, c("mean", "lifeform", "year", "month") 
+      := as.list(strsplit(variable, ".", fixed = T)[[1]]), by=variable ]
+
+#remove unneeded column that has now been separated
+df_count_mean <- df_count_mean[,variable:=NULL]
+df_count_mean <- df_count_mean[,mean:=NULL]
+
+#fix year and month as ordered factors
+df_count_mean$year <- as.factor(as.numeric(df_count_mean$year))
+df_count_mean$month <- as.factor(as.numeric(df_count_mean$month))
+
+#combine spatial units that have been split by geography
+df_count_mean <- df_count_mean %>%
+  group_by(data_id, lifeform, assess_id, year, month) %>%
+  dplyr::summarise(count=mean(count)) %>%
+  filter(!all(is.nan(count))) %>%
+  dplyr::select(data_id, assess_id, count, lifeform, year, month) %>%
+  ungroup() %>%
+  dplyr::mutate(is_point = FALSE)
+```
+Determine number of true samples per spatial unit for validation
+```{r, include=FALSE}
+df_tally_final <- df_abund_raw %>%
+  dplyr::select(data_id, assess_id, year, month, day, hour, minute) %>%
+  distinct(.keep_all = TRUE) %>%
+  group_by(data_id, assess_id, year, month) %>%
+  dplyr::summarise(n=n(),
+            .groups="drop") %>%
+  filter(assess_id %in% all_of(unique(df_count_mean$assess_id)))
+```
+Load in data for RMSE from the interpolation process and add it to output dataframe
+```{r}
+#load the raster stacks and combine them into a single megastack
+df_rmse <- data.frame()
+for(file in file_list){
+  
+  #load the raster stack
+  df_temp <- fread(paste0(dir_main, "IDW_raster_stacks", "/", file, ".csv")) %>%
+          dplyr::mutate(data_id = sub('\\/.*', '', file),
+                 .before = name)
+  df_rmse <- rbind(df_rmse, df_temp)
+  
+}
+rm(df_temp)
+
+df_rmse[, c("lifeform", "yearmon") 
+      := as.list(strsplit(name, ".", fixed = T)[[1]]), by=name ]
+
+df_rmse[, c("year", "month") 
+      := as.list(strsplit(yearmon, ",", fixed = T)[[1]]), by=yearmon ]
+
+#remove unneeded column that has now been separated
+df_rmse <- df_rmse[,name:=NULL]
+df_rmse <- df_rmse[,yearmon:=NULL]
+
+#create new variable name for n to represent the number of replicates used for the total interpolation
+names(df_rmse)[names(df_rmse) == 'n'] <- 'n_idw'
+names(df_rmse)[names(df_rmse) == 'rmse'] <- 'rmse_idw'
+```
+Merge the data with the shapefile IDs and fix factors to be ordered
+```{r}
+df_count_mean$month <- as.numeric(df_count_mean$month)
+df_tally_final$month <- as.numeric(df_tally_final$month)
+df_rmse$month <- as.numeric(df_rmse$month)
+
+shp_merged <- merge(as.data.table(df_count_mean), as.data.table(df_tally_final), by=c("data_id", "assess_id", "year", "month"),all.x=T)
+shp_merged$n[is.na(shp_merged$n)] <- 0
+shp_merged <- merge(as.data.table(shp_merged), as.data.table(df_rmse), by=c("data_id", "lifeform", "year", "month"), all.x=T)
+```
+Replace interpolated values with the original values where available
+```{r}
+pnts <- df_abund_agg_dist %>%
+  filter(is_point==FALSE) %>%
+  dplyr::select(lon, lat) %>%
+  distinct()
+
+# create a points collection
+pnts_sf <- do.call("st_sfc",c(lapply(1:nrow(pnts), 
+function(i) {st_point(as.numeric(pnts[i, ]))}), list("crs" = 4326))) 
+
+pnts_trans <- st_transform(pnts_sf, 2163) # apply transformation to pnts sf
+tt1_trans <- st_transform(shp_part, 2163)      # apply transformation to polygons sf
+
+# intersect and extract region ID name
+pnts$assess_id <- apply(st_intersects(tt1_trans, pnts_trans, sparse = FALSE), 2, 
+               function(col) { 
+                  tt1_trans[which(col), ]$assess_id
+               })
+
+#make coordinates with no polygon membership NA
+pnts$assess_id[lengths(pnts$assess_id)==0] <- NA
+  
+pnts <- unnest(pnts, assess_id)
+  
+#generate vector for labelling the extracted NC data
+pnts$assess_id <- as.factor(pnts$assess_id)
+  
+#merge with the raw data
+#simplify the data
+shp_merged <- merge(as.data.table(pnts), as.data.table(df_abund_agg_dist), by=c("lon", "lat"), all.x=TRUE) %>%
+  filter(!is.na(assess_id)) %>%
+  dplyr::group_by(data_id, lifeform, assess_id, year, month, is_point) %>%
+  dplyr::summarise(count = mean(count),
+                   n = n(),
+                   .groups = 'drop') %>%
+  dplyr::mutate(count = log10(count),
+         month = as.integer(month)) %>%
+  arrange(data_id, lifeform, assess_id, year, month) %>%
+  dplyr::select(data_id, lifeform, year, month, assess_id, count, is_point, n) %>%
+  dplyr::rename("count_raw" = count,
+         "n_raw" = n) %>%
+  right_join(shp_merged) %>%
+  dplyr::mutate(count = ifelse(!is.na(count_raw), count_raw, count),
+         rmse_idw = ifelse(!is.na(count_raw), NA, rmse_idw),
+         n_idw = ifelse(!is.na(count_raw), NA, n_idw)) %>%
+  dplyr::select(all_of(colnames(shp_merged)))
+
+```
+Process the point data to be in the same format
+```{r}
+df_abund_agg_point$assess_id <- df_datasets$assess_id[match(df_abund_agg_point$data_id, df_datasets$data_id)]
+
+shp_merged$month <- ifelse(nchar(shp_merged$month)==1, paste0( 0,shp_merged$month),shp_merged$month)
+df_abund_agg_point$month <- ifelse(nchar(df_abund_agg_point$month)==1, paste0( 0,df_abund_agg_point$month),df_abund_agg_point$month)
+
+#prepare and bind the point data with the dispersed extracted data
+df_merged <- df_abund_agg_point %>%
+  group_by(data_id, assess_id, lifeform, year, month) %>%
+  dplyr::summarise(count = mean(count, na.rm=T),
+            n = n(),
+            .groups="drop") %>%
+  ungroup() %>%
+  dplyr::mutate(count = log10(count),
+         is_point = TRUE,
+         rmse_idw=NA,
+         n_idw=NA) %>%
+  dplyr::select(all_of(colnames(shp_merged))) %>%
+  bind_rows(shp_merged) %>%
+  arrange(data_id, lifeform, assess_id, year, month)
+```
+Save the data to join with shapefile upon importation
+```{r}
+#save the data as fst
+write_fst(df_merged, path=paste(dir_shp, gsub(".shp", "", file_shp_part), "_lifeforms", ".fst", sep=""))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
