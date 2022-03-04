@@ -1,5 +1,5 @@
 # PH1-FW5_Change_in_plankton_communities
-This repository contains the code to run the PH1/FW5 lifeforms indicator which aggregates plankton abundance datasets to lifeform level and produces several metrics to detect 
+This repository contains the code to run the PH1/FW5 lifeforms indicator for the OSPAR QSR2023. This script aggregates plankton abundance datasets to lifeform level and produces several metrics to detect 
 change in plankton communities over time.
 
 The repository contains all the data files and scripts to convert the raw plankton abundance data into a set of lifeform time-series, run the PH1 indicator
