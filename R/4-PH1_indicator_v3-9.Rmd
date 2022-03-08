@@ -1081,7 +1081,7 @@ km_clust_lf <- function(x, lims, threshold){
   data_id_temp <- data_ids[t]
   
   x_data_id <- x %>% 
-    filter(data_id == all_of(data_id_temp) &
+    filter(data_id == data_id_temp &
                           year >= lims[1] &
                           year <= lims[2])
   
@@ -1184,7 +1184,7 @@ km_clust_lf <- function(x, lims, threshold){
               dplyr::mutate(year = as.integer(year),
                      count = log10(count)) %>%
               nest() %>%
-              mutate(fits = map(data, ~EnvStats::kendallTrendTest(abundance_mean ~ year, ci.slope=FALSE, data=.x)),
+              mutate(fits = map(data, ~EnvStats::kendallTrendTest(count ~ year, ci.slope=FALSE, data=.x)),
                 fits2 = map(fits, ~structure(.x, class="htest")),
                 fits3 = map(fits2, ~tidy(.x))) %>%
               dplyr::select(-c(data, fits, fits2)) %>%
