@@ -596,7 +596,7 @@ kendallAll <- function(x){
     filter(count >= 3) %>%
     dplyr::mutate(year=as.integer(year)) %>%
     nest() %>%
-    mutate(fits = map(data, ~EnvStats::kendallTrendTest(abundance_mean ~ year, ci.slope=FALSE, data=.x)),
+    mutate(fits = map(data, ~EnvStats::kendallTrendTest(count_mean ~ year, ci.slope=FALSE, data=.x)),
            fits2 = map(fits, ~structure(.x, class="htest")),
            fits3 = map(fits2, ~tidy(.x))) %>%
     dplyr::select(-c(data, fits, fits2)) %>%
